@@ -5,8 +5,8 @@ set -xeuo pipefail
 export NCCL_IB_DISABLE=1
 export CUDA_HOME="$CONDA_PREFIX"
 
-STUDENT_MODEL=${STUDENT_MODEL:-/hdd/u202212063031/magi/Qwen3-VL/models/Qwen3-VL-4B-DSL-SFT-v3.1-e1}
-TRAIN_FILE=${TRAIN_FILE:-data/manga109_dsl_v3.parquet}
+STUDENT_MODEL=${STUDENT_MODEL:-models/Qwen3-VL-4B-DSL-SFT-v3.1-e1}
+TRAIN_FILE=${TRAIN_FILE:-data/train.parquet}
 VAL_FILE=${VAL_FILE:-data/val.parquet}
 PROMPT_KEY=${PROMPT_KEY:-prompt}
 
