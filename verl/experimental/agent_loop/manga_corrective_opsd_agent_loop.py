@@ -18,11 +18,13 @@ from verl.trainer.manga import MangaExecutor, TargetGraph
 from verl.trainer.manga.command_teacher import (
     sg, select_target, signature,
     teacher_chat, dependency_graph, frontier,
+    proposal_stats,
 )
 from verl.utils.tokenizer import build_multimodal_processor_inputs
 from verl.utils.tokenizer.chat_template import apply_chat_template
 
 from verl.trainer.manga.local_policy import COMMAND_MAX_TOKENS, COMMAND_STOPS, command_boundary, Support, local_chat, mix_sparse, vocabulary_for, can_match_box
+
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +64,9 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
         self.teacher_topk_initial = int(cfg.manga_teacher_topk_initial)
         self.teacher_topk_max = int(cfg.manga_teacher_topk_max)
         self.teacher_min_mass = float(cfg.manga_teacher_min_mass)
+        self.correctness_loss = bool(cfg.manga_correctness_loss)
+        if self.correctness_loss and self.rollout_config.name != "vllm":
+            raise ValueError("Sparse student candidate scoring requires the vLLM rollout backend")
         if self.max_commands <= 0:
             raise ValueError("manga_max_commands must be positive")
 
@@ -178,21 +183,15 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
 
     async def _score_branch(self, *, start, branch, teacher_prompt, image, mm_kwargs,
                             routing_key, history, command, legal, reason, expected,
-                            counters, semaphore):
+                            counters, semaphore, student_prompt_ids=None, student_route=None):
         contexts = teacher_prompt
-        await asyncio.gather(*(c['ready'] for c in contexts))
         # Warm only the original-image history, before the appended thumbnail.
         # Different thumbnail hashes must never contaminate the shared prefix.
         vision_start = self.tokenizer.convert_tokens_to_ids('<|vision_start|>')
         if not hasattr(self, '_teacher_cache_namespace'):
             self._teacher_cache_namespace = uuid4().hex
-        for context in contexts:
-            starts = [i for i, token in enumerate(context['ids']) if token == vision_start]
-            context['prefill'] = (dict(length=starts[1], image_count=1,
-                namespace=self._teacher_cache_namespace) if len(starts) == 2 else None)
         def build_component_schedule():
-            # Only semantic milestones select components. No vocabulary traversal,
-            # coordinate feasibility search or per-prefix legal-token mask.
+            # Filter action choices only; object prefixes prune components, not logits.
             text = self._decode(branch)
             action_end = text.find('>') + 1
             boxes = list(sg.BOX_RE.finditer(text.split('<text>', 1)[0]))
@@ -207,10 +206,34 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
             if payload_start >= 0:
                 fixed = [(a,b) for a,b in fixed if b <= payload_start + 6 or a >= payload_end]
             masks, active_rows = [], []
+            action_rows = {}
+            actions = {c['support'].command.split('>', 1)[0] + '>' for c in contexts}
+            encoded_actions = [self.tokenizer.encode(action, add_special_tokens=False) for action in actions]
             previous = 0
+            payload_active = None
+            payload_boxes = ([ (m.start() + len(sg.BOX_START), m.end() - len(sg.BOX_END))
+                               for m in sg.BOX_RE.finditer(text) if m.start() > payload_start ]
+                             if selected_kind == 'ground' and payload_start >= 0 else [])
+            def payload_mask(begin, end, token):
+                return None if any(begin < b and end > a for a, b in payload_boxes) else [token]
             for i, token in enumerate(branch):
+                # After the selected head, canonical content and closing syntax
+                # are deterministic. Reuse the last head's component set and avoid
+                # quadratic prefix decoding / repeated geometry for long captions.
+                if payload_active is not None:
+                    active_rows.append(payload_active)
+                    if payload_boxes:
+                        end = len(self._decode(branch[:i+1]))
+                        masks.append(payload_mask(previous, end, token))
+                        previous = end
+                    else:
+                        masks.append([token])
+                    continue
                 end = len(self._decode(branch[:i+1]))
                 active = set()
+                prefix = text[:previous].split('<text>', 1)[0]
+                starts = [m.end() for m in re.finditer(re.escape(sg.BOX_START), prefix)]
+                partial_boxes = [prefix[start:].split('<', 1)[0] for start in starts]
                 for j, context in enumerate(contexts):
                     key = context['support'].key
                     if previous >= action_end and key[0] != selected_kind:
@@ -221,15 +244,11 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
                     if len(boxes) > 1 and previous >= boxes[1].end() and key != selected_key:
                         continue
                     # Consume only tokens BEFORE the predictor being supervised.
-                    prefix = text[:previous].split('<text>', 1)[0]
-                    candidate_head = context['support'].command.split('<text>', 1)[0]
-                    targets = [sg._match_box(m, 0) for m in sg.BOX_RE.finditer(candidate_head)]
-                    starts = [m.end() for m in re.finditer(re.escape(sg.BOX_START), prefix)]
+                    targets = context['support'].targets
                     possible = True
-                    for box_index, start in enumerate(starts):
+                    for box_index, partial in enumerate(partial_boxes):
                         if box_index >= len(targets):
                             possible = False; break
-                        partial = prefix[start:].split('<', 1)[0]
                         threshold = self.iou_threshold if key[0] == 'detect' else 0.95
                         if not can_match_box(partial, targets[box_index], threshold):
                             possible = False; break
@@ -238,12 +257,41 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
                 if not active:
                     raise RuntimeError(f'No teacher at semantic selection boundary: {command!r}')
                 active_rows.append(active)
-                masks.append([token] if end > previous and any(a <= previous and end <= b for a,b in fixed) else None)
+                # Resolve the completed head once, including a token that spans
+                # box_end and text markup, before reusing its surviving components.
+                if (getattr(self, 'correctness_loss', False) and payload_start >= 0
+                        and previous >= payload_start + 6):
+                    payload_active = active
+                if end > previous and any(a <= previous and end <= b for a,b in fixed):
+                    support_mask = [token]
+                elif previous < action_end:
+                    # Action tokens use the surviving executable choices.
+                    # Correctness mode also conditions object/reference tokens below.
+                    support_mask = sorted({encoded[i] for encoded in encoded_actions
+                        if i < len(encoded) and encoded[:i] == branch[:i]})
+                    if not support_mask:
+                        raise RuntimeError(f'Empty decision support at {text[:previous]!r}')
+                    if (token in support_mask['exclude'] if isinstance(support_mask, dict)
+                            else token not in support_mask):
+                        raise RuntimeError(f'Accepted command outside decision support at {text[:previous]!r}')
+                    action_rows[i] = support_mask
+                elif getattr(self, 'correctness_loss', False):
+                    # GT text is canonicalized before execution. Once its head
+                    # is selected, no teacher guesses are needed for the payload.
+                    if payload_start >= 0 and previous >= payload_start + 6:
+                        support_mask = payload_mask(previous, end, token)
+                    else:
+                        # Object candidates are checked after sparse model scoring.
+                        # Never walk the entire vocabulary to construct this set.
+                        support_mask = None
+                else:
+                    support_mask = None
+                masks.append(support_mask)
                 previous = end
-            return masks, active_rows
+            return masks, active_rows, action_rows
 
         try:
-            masks, active_rows = await self.loop.run_in_executor(None, build_component_schedule)
+            masks, active_rows, action_rows = await self.loop.run_in_executor(None, build_component_schedule)
         except BaseException:
             ready_jobs = [c['ready'] for c in contexts if 'ready' in c]
             for job in ready_jobs:
@@ -251,9 +299,17 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
             await asyncio.gather(*ready_jobs, return_exceptions=True)
             raise
 
+        # Preserve the full readiness barrier and length preflight, but overlap
+        # support construction with image/prompt preparation rather than serializing.
+        await asyncio.gather(*(c['ready'] for c in contexts))
+        for context in contexts:
+            starts = [i for i, token in enumerate(context['ids']) if token == vision_start]
+            context['prefill'] = (dict(length=starts[1], image_count=1,
+                namespace=self._teacher_cache_namespace) if len(starts) == 2 else None)
+
         async def score(component_index, context):
             # A component participates through its divergence position, then exits.
-            # Remaining components contribute their unmasked distributions.
+            # Keep raw legal mass so aggregation conditions the mixture only once.
             count = len(branch)
             if 'ready' in context:
                 await context['ready']
@@ -264,34 +320,22 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
             positions = list(range(len(context['ids'])-1, len(context['ids'])+count-1))
             sequence = context['ids'] + branch[:count]
             result = {}
-            action_support = {}
-            actions = {c['support'].command.split('>', 1)[0] + '>' for c in contexts}
-            for i in range(count):
-                prefix = self._decode(branch[:i])
-                if '>' in prefix:
-                    break
-                # Only action-name prefixes; no object/content vocabulary masks.
-                token_options = set()
-                for action in actions:
-                    encoded = self.tokenizer.encode(action, add_special_tokens=False)
-                    if encoded[:i] == branch[:i] and i < len(encoded):
-                        token_options.add(encoded[i])
-                if token_options:
-                    action_support[str(positions[i])] = sorted(token_options)
+            action_support = {str(positions[i]): mask for i, mask in action_rows.items()}
             pending = []
             for i, mask in enumerate(masks):
                 if component_index not in active_rows[i]:
                     continue
                 if isinstance(mask, list) and len(mask) == 1:
-                    token = mask[0]
-                    result[i] = ([token], [0.], 0.)
+                    # Aggregation constructs singleton targets once per token;
+                    # no per-component duplicate result is consumed.
                     counters['teacher_deterministic_rows'] += 1
                     counters['teacher_scored_rows'] += 1
                 else:
                     pending.append(i)
             if not pending:
                 counters['teacher_skipped_components'] += 1
-            k = self.teacher_topk_initial
+            sparse_mode = getattr(self, 'correctness_loss', False)
+            k = min(self.teacher_topk_initial, self.teacher_topk_max)
             while pending:
                 async with semaphore:
                     if any('ready' in c and not c['ready'].done() for c in contexts):
@@ -300,8 +344,9 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
                         sequence_ids=sequence[:len(context['ids'])+max(pending)+1],
                         multi_modal_data={'images':[image, context['image']]}, mm_processor_kwargs=mm_kwargs,
                         routing_key=routing_key, request_id=uuid4().hex,
-                        positions=[positions[i] for i in pending], allowed_ids=None,
-                        topk_override=k, return_sampled=True, raw_legal_probabilities=True,
+                        positions=[positions[i] for i in pending],
+                        allowed_ids=None,
+                        topk_override=k, return_sampled=True, raw_legal_probabilities=not sparse_mode,
                         shared_prefill=context['prefill'], action_support=action_support)
                 counters['scoring_requests'] += 1
                 retry = []
@@ -309,9 +354,16 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
                 # kernels and Python conversions for every scored position.
                 id_rows, log_rows = ids.tolist(), logs.tolist()
                 legal_masses = torch.as_tensor(sampled, dtype=logs.dtype, device=logs.device)
-                masses = (logs - legal_masses[:, None]).exp().sum(-1).tolist()
+                masses = [] if sparse_mode else (logs - legal_masses[:, None]).exp().sum(-1).tolist()
                 legal_rows = legal_masses.tolist()
                 for row, i in enumerate(pending):
+                    if sparse_mode:
+                        # Keep the accepted token even if it fell outside teacher top-k.
+                        values = dict(zip(id_rows[row], log_rows[row]))
+                        values[branch[i]] = legal_rows[row]
+                        result[i] = (list(values), list(values.values()), 0.)
+                        counters['teacher_scored_rows'] += 1
+                        continue  # Fixed budget: no adaptive full-prefix rescoring.
                     result[i] = (id_rows[row], log_rows[row], legal_rows[row])
                     mass = masses[row]
                     if mass < self.teacher_min_mass and k < self.teacher_topk_max:
@@ -337,6 +389,14 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
             raise
         if any(result is None for result in results):
             return None
+        if not hasattr(self, '_diagnostic_action_encodings'):
+            self._diagnostic_action_encodings = [
+                self.tokenizer.encode(tag, add_special_tokens=False) for tag in sg.ACTION_TAGS]
+        # Exclude common syntax such as '<', but retain a single legal option
+        # when other DSL actions are possible lexically and illegal in this state.
+        decision_support = {i: options for i, options in action_rows.items()
+            if len({encoded[i] for encoded in self._diagnostic_action_encodings
+                    if i < len(encoded) and encoded[:i] == branch[:i]}) > 1}
         def aggregate():
             from collections import Counter
             deltas = Counter()
@@ -368,8 +428,12 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
                 deltas['teacher_output_tail_mass_sum'] += max(0., 1-math.fsum(math.exp(p) for p in logs))
             deltas['supervised_tokens'] += len(branch)
             output = dict(start=start, branch=branch, legal=legal,
+                        action_support=decision_support,
                         teacher_ids=torch.tensor(out_ids, dtype=torch.long),
                         teacher_logprobs=torch.tensor(out_logs, dtype=torch.float32))
+            if getattr(self, 'correctness_loss', False):
+                output['correct_support'] = masks
+                output['object_positions'] = [i for i, mask in enumerate(masks) if mask is None]
             return output, deltas
         output, deltas = await self.loop.run_in_executor(None, aggregate)
         counters.update(deltas)
@@ -392,16 +456,8 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
         async def prepare(context, candidate):
             async with preparation_slots:
                 def thumbnail():
-                    from PIL import ImageDraw
-                    result = original.convert('RGB').copy()
-                    result.thumbnail((448, 448))
-                    draw = ImageDraw.Draw(result)
-                    for i, box in enumerate(context['boxes']):
-                        rectangle = sg._pixel_box(box, *result.size)
-                        draw.rectangle(rectangle, outline='red', width=2)
-                        label = chr(65+i) if context['support'].key[0] == 'link' else str(i+1)
-                        draw.text((rectangle[0], rectangle[1]), label, fill='red')
-                    return result
+                    from verl.trainer.manga.privileged_thumbnail import render_thumbnail
+                    return render_thumbnail(original, context['boxes'], context['support'].key[0])
                 image_key = (context['support'].key[0], context['boxes'])
                 task = self._target_image_cache.get(image_key)
                 if task is None:
@@ -473,7 +529,29 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
         selected, _, reason = select_target(executor, self._decode(raw_ids).strip())
         if selected is None:
             return None
-        for repair_round in range(min(remaining, COMMAND_MAX_TOKENS)):
+        # Repair work is not final sequence length: discarded suffixes also cost
+        # decoding time. Bound retries separately from the 896-token command cap.
+        max_rounds = 16
+        token_budget = 2 * COMMAND_MAX_TOKENS
+        generated_tokens = 0
+        seen = set()
+        best_prefix = -1
+        stagnant = 0
+        rounds = 0
+        def bounded_fallback(cause):
+            counters['repair_' + cause] += 1
+            counters['gt_fallbacks'] += 1
+            counters['fallback_' + reason] += 1
+            logger.warning("Bounded OPSD repair route=%s cause=%s rounds=%d generated_tokens=%d best_prefix=%d command_tokens=%d",
+                           route_id, cause, rounds, generated_tokens, best_prefix, len(raw_ids))
+            return selected
+        for repair_round in range(min(remaining, max_rounds)):
+            if generated_tokens >= token_budget:
+                return bounded_fallback('token_budget')
+            state = tuple(raw_ids)
+            if state in seen:
+                return bounded_fallback('no_progress')
+            seen.add(state)
             # Locate the first impossible prefix, not the first non-GT coordinate.
             prefix = []
             for token in raw_ids:
@@ -506,6 +584,14 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
                 counters['gt_fallbacks'] += 1
                 counters['fallback_' + reason] += 1
                 return selected
+            # Use the actual prefix after any rollback, not the optimistic scan.
+            if len(prefix) > best_prefix:
+                best_prefix, stagnant = len(prefix), 0
+            else:
+                stagnant += 1
+                if stagnant >= 4:
+                    return bounded_fallback('no_progress')
+            rounds += 1
             if len(allowed) == 1:
                 chosen = allowed
                 counters['student_forced_tokens'] += 1
@@ -514,19 +600,28 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
                 generated = await self._generate(prompt_ids, history + prefix, images, None, None,
                     mm_kwargs, sampling, max_tokens=1, stop=[], priority=int(priority), routing_request_id=route_id)
                 chosen = list(generated.token_ids)
+                generated_tokens += len(chosen)
+                counters['repair_generated_tokens'] += len(chosen)
                 if len(chosen) != 1 or chosen[0] not in allowed:
                     raise RuntimeError('Student legal-token sampling returned an invalid token')
+            if generated_tokens >= token_budget:
+                return bounded_fallback('token_budget')
+            retained = len(prefix) + len(chosen)
+            # _sample_command subtracts prefix length from remaining. Limit only
+            # newly generated suffix tokens; never charge the retained history.
+            repair_remaining = min(remaining, retained + token_budget - generated_tokens)
             _, retried, truncated = await self._sample_command(prompt_ids, history, images, mm_kwargs,
-                sampling_params, priority, route_id, remaining, prefix=prefix + chosen)
+                sampling_params, priority, route_id, repair_remaining, prefix=prefix + chosen)
+            produced = max(0, len(retried) - retained)
+            generated_tokens += produced
+            counters['repair_generated_tokens'] += produced
             text = self._decode(retried).strip()
             if not truncated and signature(executor, text) is not None:
                 counters['retry_successes'] += 1
                 return text
             # Preserve the repaired prefix and repair any later illegal choice.
             raw_ids = retried
-        counters['gt_fallbacks'] += 1
-        counters['fallback_' + reason] += 1
-        return selected
+        return bounded_fallback('round_limit')
 
     async def run(self, sampling_params, priority=0, validate=False, **kwargs):
         # Validation is the original, unshielded student rollout with no teacher.
@@ -627,6 +722,10 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
                     set_response(response_text + assistant_suffix)
                     break
                 original_command = command
+                # Inspect the unmodified proposal, before EOS recovery or repair.
+                proposal_kind = executor.action_kind(original_command)
+                for name, value in executor.proposal_diagnostics(original_command).items():
+                    counters[f"proposal_{proposal_kind}_{name}"] += value
                 if not command:
                     if not raw_ids:
                         counters["empty_generation"] += 1
@@ -658,6 +757,11 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
                     if command is None:
                         counters['no_target'] += 1
                         break
+                if getattr(self, 'correctness_loss', False):
+                    from verl.trainer.manga.command_teacher import correct_content
+                    corrected = correct_content(executor, command)
+                    counters['content_corrected'] += int(corrected != command)
+                    command = corrected
                 pending_jobs = [job for job in score_jobs if not job.done()]
                 if len(pending_jobs) >= self.teacher_max_inflight:
                     await asyncio.wait(pending_jobs, return_when=asyncio.FIRST_COMPLETED)
@@ -725,9 +829,10 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
                 branch_job = asyncio.create_task(self._score_branch(
                     start=next_commands[-1]["start"], branch=branch_content,
                     teacher_prompt=teacher_prompt, image=image, mm_kwargs=mm_kwargs,
-                    routing_key=routing, history=list(history), command=command,
+                    routing_key=routing, history=list(next_ids[:next_commands[-1]["start"]]), command=command,
                     legal=legal, reason=reason, expected=expected,
-                    counters=counters, semaphore=semaphore))
+                    counters=counters, semaphore=semaphore,
+                    student_prompt_ids=prompt_ids, student_route=route_id))
                 score_jobs.append(branch_job)
                 # Length preflight gates acceptance, not ready-component submission.
                 await asyncio.gather(*(c['ready'] for c in teacher_prompt))
@@ -859,6 +964,9 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
         mask = [0] * len(response)
         command_types = [0] * len(response)
         command_starts = [False] * len(response)
+        action_ids = [[-1] * len(response) for _ in range(5)]
+        single_mask, multi_mask, correct_edges = [False] * len(response), [False] * len(response), []
+        group_weights = [[0., 0., 0.] for _ in response]
         kinds = ("enter", "detect", "read", "link", "ground")
         for item in commands:
             start, size = item["start"], len(item["branch"])
@@ -869,6 +977,39 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
             if kind in kinds:
                 command_types[start:start + size] = [kinds.index(kind) + 1] * size
             command_starts[start] = True
+            if getattr(self, 'correctness_loss', False):
+                supports = item['correct_support']
+                if len(supports) != size:
+                    raise ValueError('Correctness supports must cover the whole command')
+                for offset, options in enumerate(supports):
+                    position = start + offset
+                    single_mask[position] = options is not None and len(options) == 1
+                    multi_mask[position] = not single_mask[position]
+                    if options is not None and len(options) > 1:
+                        correct_edges.extend((position, token) for token in options)
+            for offset, options in item.get("action_support", {}).items():
+                if len(options) > len(action_ids):
+                    raise ValueError("Action diagnostic support exceeds five DSL actions")
+                for column, token in enumerate(options):
+                    action_ids[column][start + offset] = token
+            if getattr(self, 'correctness_loss', False):
+                # One object decision comprises its type and coordinate tokens.
+                # Fixed markup is content/format, not a decision. Link endpoints
+                # are two decisions; each caption reference is another object decision.
+                object_groups = {}
+                for offset in item.get('object_positions', ()):
+                    prefix = self._decode(item['branch'][:offset])
+                    object_index = prefix.count(sg.BOX_END)
+                    object_groups.setdefault(object_index, []).append(start + offset)
+                for positions in object_groups.values():
+                    for position in positions:
+                        group_weights[position][1] = 1. / len(positions)
+                for offset in range(size):
+                    position = start + offset
+                    if offset in item.get('action_support', {}):
+                        group_weights[position][0] = 1.
+                    elif not group_weights[position][1]:
+                        group_weights[position][2] = 1.
             causal = len(prompt_ids) + start - 1
             ids[causal:causal + size] = item["teacher_ids"]
             logprobs[causal:causal + size] = item["teacher_logprobs"]
@@ -876,7 +1017,20 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
         for position in boundary_positions:
             boundary_mask[position] = True
         if any(a and b for a, b in zip(mask, boundary_mask)):
-            raise ValueError("KL and CE supervision must not overlap")
+            raise ValueError("Command and boundary supervision must not overlap")
+        boundary_targets = {}
+        for position in boundary_positions:
+            causal = len(prompt_ids) + position - 1
+            token = response[position]
+            if token not in boundary_targets:
+                target_ids, target_logs, _ = mix_sparse([([token], [0.])], [1.], self.topk)
+                boundary_targets[token] = (
+                    torch.tensor(target_ids, dtype=ids.dtype, device=ids.device),
+                    torch.tensor(target_logs, dtype=logprobs.dtype, device=logprobs.device))
+            ids[causal], logprobs[causal] = boundary_targets[token]
+            mask[position] = 1
+            single_mask[position] = True
+            group_weights[position][2] = 1.
         response_mask = [int(a or b) for a, b in zip(mask, boundary_mask)]
         # Observe delimiter dilution without changing gradient weights. Match
         # exact standalone special tokens; never classify action names as syntax.
@@ -893,15 +1047,24 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
             precomputed_multi_modal_inputs=self.precomputed_multi_modal_inputs,
             extra_fields={
                 "teacher_ids": ids, "teacher_logprobs": logprobs,
+                **({"manga_group_weights": torch.tensor(group_weights, dtype=torch.float32),
+                    "manga_single_mask": torch.tensor(single_mask, dtype=torch.bool),
+                    "manga_multi_mask": torch.tensor(multi_mask, dtype=torch.bool),
+                    "manga_content_corrections": torch.tensor([counters['content_corrected']], dtype=torch.long),
+                    "manga_correct_edges": torch.tensor(correct_edges, dtype=torch.long).reshape(-1, 2)}
+                   if getattr(self, 'correctness_loss', False) else {}),
                 "manga_opsd_mask": torch.tensor(mask, dtype=torch.bool),
                 "manga_delimiter_mask": torch.tensor(delimiter_mask, dtype=torch.bool),
                 "manga_boundary_mask": torch.tensor(boundary_mask, dtype=torch.bool),
                 "manga_command_types": torch.tensor(command_types, dtype=torch.long),
                 "manga_command_starts": torch.tensor(command_starts, dtype=torch.bool),
+                **{f"manga_action_ids_{i}": torch.tensor(values, dtype=torch.long)
+                   for i, values in enumerate(action_ids)},
                 "manga_command_stats": torch.tensor(
                     [counters[f"{kind}_{metric}"] for kind in kinds
                      for metric in ("sampled", "illegal", "changed", "executed")]
-                    + [counters["enter_dependency_blocked"]], dtype=torch.float32),
+                    + [counters["enter_dependency_blocked"]]
+                    + proposal_stats(counters), dtype=torch.float32),
                 "manga_boundary_stats": torch.tensor([counters[name] for name in (
                     "student_requests", "early_eos", "continue_boundaries", "continue_errors",
                     "terminal_boundaries", "terminal_errors", "mixed_boundary_tokens",
@@ -920,7 +1083,8 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
                     "fallback_direct_target", "fallback_dag_prerequisite",
                     "fallback_unmatched_target_fallback", "fallback_completed_target_fallback",
                     "student_forced_tokens", "teacher_image_preprocess_reused",
-                    "teacher_submissions_during_preparation")],
+                    "teacher_submissions_during_preparation", "repair_no_progress", "repair_round_limit",
+                    "repair_token_budget", "repair_generated_tokens")],
                     dtype=torch.float32),
                 "min_global_steps": min_step, "max_global_steps": max_step,
                 "manga_opsd_precomputed": True,

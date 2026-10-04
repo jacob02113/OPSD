@@ -273,6 +273,9 @@ class DistillationConfig(BaseConfig):
     teacher_key: str = "data_source"
     # Student-goal-driven distillation on canonical GT execution histories.
     manga_opsd_enabled: bool = False
+    manga_action_illegal_weight: float = 1.0
+    manga_correctness_loss: bool = False
+    manga_preference_weight: float = 0.1
     manga_target_key: str = "target_json"
     manga_entity_iou_threshold: float = 0.5
     manga_teacher_max_inflight: int = 4
@@ -284,6 +287,14 @@ class DistillationConfig(BaseConfig):
     distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
 
     def __post_init__(self):
+        if self.manga_correctness_loss and self.manga_teacher_topk_max < 5:
+            raise ValueError('Correctness loss requires at least five teacher action candidates')
+        if not math.isfinite(self.manga_preference_weight) or self.manga_preference_weight < 0:
+            raise ValueError('manga_preference_weight must be finite and nonnegative')
+        if self.manga_correctness_loss and not self.manga_opsd_enabled:
+            raise ValueError('manga_correctness_loss requires manga_opsd_enabled')
+        if not math.isfinite(self.manga_action_illegal_weight) or self.manga_action_illegal_weight < 0:
+            raise ValueError("manga_action_illegal_weight must be finite and nonnegative")
         if self.manga_opsd_enabled and not self.enabled:
             raise ValueError("manga_opsd_enabled=True requires distillation.enabled=True.")
         if not self.enabled:
@@ -302,7 +313,7 @@ class DistillationConfig(BaseConfig):
             if loss.jsd_token_clip is not None or loss.loss_max_clamp is not None:
                 raise ValueError("Manga OPSD requires unclipped forward KL")
             if loss.use_task_rewards or loss.use_policy_gradient:
-                raise ValueError("Manga OPSD uses only direct forward KL")
+                raise ValueError("Manga OPSD uses direct supervised losses, not policy gradients")
 
         self.teacher_models = self._resolve_teacher_models()
         teacher_world_size_sum = 0

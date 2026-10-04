@@ -87,6 +87,11 @@ class MetricsAggregator:
                 return agg_type
 
         metric_lower = metric_name.lower()
+        if metric_lower.startswith("actor/manga_command/") and metric_lower.endswith((
+            "_sampled", "_illegal", "_changed", "_executed", "_action_legal",
+            "_object_checked", "enter_dependency_blocked",
+        )):
+            return "sum"
         if metric_lower.endswith("/lr") or metric_lower.endswith("_lr") or metric_lower == "lr":
             return "last"
         if "timing_s/" in metric_lower or "timing_per_token_ms/" in metric_lower:

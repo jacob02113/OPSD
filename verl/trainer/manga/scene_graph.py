@@ -236,6 +236,27 @@ class MangaExecutor:
             "<ground>": "ground",
         }.get(tag, "invalid")
 
+    def proposal_diagnostics(self, command: str) -> dict[str, int]:
+        """Classify a raw proposal in the pre-command state without mutation.
+
+        Gate by action first, then syntax, then the selected objects. Object
+        errors include unavailable/completed targets, unmet object prerequisites,
+        and GT-incompatible link endpoints, not only unresolved box references.
+        READ/GROUND payload quality is deliberately not checked by this oracle.
+        """
+        command = command.strip()
+        kind = self.action_kind(command)
+        action_legal = kind in self.frontier_kinds()
+        result = dict(proposal_sampled=1, action_illegal=int(not action_legal),
+                      action_legal=int(action_legal), syntax_illegal=0,
+                      object_checked=0, object_illegal=0)
+        if action_legal:
+            evaluation = self.evaluate(command, compute_reward=False)
+            result["syntax_illegal"] = int(not evaluation.syntax_valid)
+            result["object_checked"] = int(evaluation.syntax_valid)
+            result["object_illegal"] = int(evaluation.syntax_valid and not evaluation.executable)
+        return result
+
     def _eligible_detection(self, kind: str, predicted: Box) -> tuple[int, float] | None:
         if kind == "character":
             boxes = self.target.character_boxes
@@ -252,9 +273,18 @@ class MangaExecutor:
         ]
         return max(candidates, key=lambda item: (item[1], -item[0])) if candidates else None
 
+    def ground_character_indices(self) -> dict[Box, int]:
+        # Bbox references cannot distinguish duplicate annotations. Use one
+        # canonical mapping for prerequisites, candidate text and scoring.
+        cached = getattr(self, "_ground_character_indices", None)
+        if cached is None:
+            cached = {box: index for index, box in enumerate(self.target.character_boxes)}
+            self._ground_character_indices = cached
+        return cached
+
     def _ground_required(self, panel_index: int) -> set[int]:
         grounding = self.grounding_by_panel[panel_index]
-        character_index = {box: index for index, box in enumerate(self.target.character_boxes)}
+        character_index = self.ground_character_indices()
         return {
             character_index[_box(box)]
             for mention in grounding.get("mentions", ())
@@ -333,12 +363,12 @@ class MangaExecutor:
 
     def _ground_entity_f1(self, panel_index: int, raw_caption: str) -> float:
         grounding = self.grounding_by_panel[panel_index]
+        character_indices = self.ground_character_indices()
         gt = {
-            (int(mention["start"]), int(mention["end"]), character_index)
+            (int(mention["start"]), int(mention["end"]), character_indices[_box(raw_box)])
             for mention in grounding.get("mentions", ())
             for raw_box in mention.get("character_bboxes", ())
-            for character_index, box in enumerate(self.target.character_boxes)
-            if box == _box(raw_box)
+            if _box(raw_box) in character_indices
         }
 
         predicted: set[tuple[int, int, int]] = set()
@@ -384,7 +414,7 @@ class MangaExecutor:
         best, score = None, 0.95
         for registered, index in mapping.items():
             overlap = iou(box, registered)
-            if overlap > score:
+            if overlap >= 0.95 and (best is None or overlap > score):
                 best, score = index, overlap
         return best
 

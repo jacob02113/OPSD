@@ -109,7 +109,7 @@ def can_match_box(text, target, threshold):
             if index < len(domain): candidates.add(domain[index])
             if index: candidates.add(domain[index-1])
         points.append(sorted(candidates))
-    return any(b[0] < b[2] and b[1] < b[3] and (sg.iou(b, target) > threshold if threshold == 0.95 else sg.iou(b, target) >= threshold)
+    return any(b[0] < b[2] and b[1] < b[3] and sg.iou(b, target) >= threshold
                for b in itertools.product(*points))
 
 
@@ -120,6 +120,14 @@ class Support:
         if self.key is None:
             raise ValueError('Nonexecutable teacher candidate')
         self.alias = alias if alias and signature(executor, alias) == self.key else None
+        self.template = command.split('<text>', 1)[0]
+        self.references = []
+        for match in sg.BOX_RE.finditer(self.template):
+            kind = self.template[:match.start()].rsplit(sg.REF_START, 1)[-1].split(sg.REF_END, 1)[0]
+            mapping = (executor.state.text_by_student_box if kind == 'text' else
+                       executor.state.character_by_student_box if kind == 'character' else executor.panel_by_box)
+            self.references.append((match, sg._match_box(match, 0), mapping))
+        self.targets = tuple(target for _, target, _ in self.references)
         # An instance-owned cache dies with this command's teacher contexts.
         # A decorator on the method would retain old executor snapshots globally.
         self.viable = lru_cache(maxsize=2048)(self._viable)
@@ -132,16 +140,16 @@ class Support:
         elif self.key[0] in ('read', 'ground'):
             self.head = command[:command.index('<text>')+6]
 
-    def reference_prefix(self, prefix):
+    def reference_prefix(self, prefix, start_ref=0):
         """Normalize completed reference boxes for syntax checks only.
 
         Return (prefix, partial_box). Payload text is never rewritten.
         """
         if self.key[0] == 'detect':
             return prefix, False
-        template = self.command.split('<text>', 1)[0]
-        cursor = 0
-        for match in sg.BOX_RE.finditer(template):
+        template = self.template
+        cursor = self.references[start_ref-1][0].end() if start_ref else 0
+        for match, target, mapping in self.references[start_ref:]:
             start = match.start()
             # Earlier boxes have already been normalized to template lengths.
             if len(prefix) <= start:
@@ -149,7 +157,6 @@ class Support:
             if prefix[cursor:start] != template[cursor:start]:
                 return None, False
             close = prefix.find(sg.BOX_END, start)
-            target = sg._match_box(match, 0)
             if close < 0:
                 box_text = prefix[start:]
                 if not box_text.startswith(sg.BOX_START):
@@ -162,15 +169,13 @@ class Support:
             actual = sg.BOX_RE.fullmatch(prefix[start:end])
             if actual is None:
                 return None, False
-            box = sg._match_box(actual, 0)
-            if box != target and sg.iou(box, target) <= 0.95:
+            try:
+                box = sg._match_box(actual, 0)
+            except ValueError:
+                return None, False
+            if box != target and sg.iou(box, target) < 0.95:
                 return None, False
             # Match the registered identity, not just an overlapping candidate.
-            before = template[:start]
-            kind = before.rsplit(sg.REF_START, 1)[-1].split(sg.REF_END, 1)[0]
-            mapping = (self.executor.state.text_by_student_box if kind == 'text' else
-                       self.executor.state.character_by_student_box if kind == 'character' else
-                       self.executor.panel_by_box)
             if self.executor.resolve_reference(mapping, box) != mapping.get(target):
                 return None, False
             prefix = prefix[:start] + match.group(0) + prefix[end:]
@@ -181,8 +186,26 @@ class Support:
         normalized, partial = self.reference_prefix(prefix)
         return normalized is not None and not partial and normalized.startswith(self.head)
 
-    def _viable(self, prefix):
-        prefix, partial_box = self.reference_prefix(prefix)
+    def continuation(self, prefix):
+        """Validate new token suffixes without rechecking already resolved objects.
+
+        Normalization is internal only: the sampled coordinates and training
+        sequence remain unchanged. Each link target still has its own predicate.
+        """
+        normalized, _ = self.reference_prefix(prefix)
+        if normalized is None:
+            return lambda suffix: False
+        skip = 0
+        if self.key[0] != 'detect':
+            skip = min(len(self.references), normalized.split('<text>', 1)[0].count(sg.BOX_END))
+        return lambda suffix: self.viable(normalized + suffix, skip)
+
+    def _viable(self, prefix, start_ref=0):
+        # Exact template prefixes need no geometry or executor parse. This also
+        # makes action selection a cheap finite set of literal continuations.
+        if self.command.startswith(prefix):
+            return True
+        prefix, partial_box = self.reference_prefix(prefix, start_ref)
         if prefix is None:
             return False
         if partial_box:
@@ -297,7 +320,8 @@ class Vocabulary:
             return self.text_mask
         result = set()
         if structural:
-            stack = [(self.trie, prefix, structural)]
+            predicates = [s.continuation(prefix) for s in structural]
+            stack = [(self.trie, "", predicates)]
             while stack:
                 node, text, active = stack.pop()
                 result.update(node.get(None, ()))
@@ -305,7 +329,7 @@ class Vocabulary:
                     if char is None:
                         continue
                     extended = text + char
-                    remaining = [s for s in active if s.viable(extended)]
+                    remaining = [predicate for predicate in active if predicate(extended)]
                     if remaining:
                         stack.append((child, extended, remaining))
         if excluded is not None:

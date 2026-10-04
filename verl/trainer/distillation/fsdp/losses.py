@@ -75,7 +75,9 @@ def kl_divergence(log_q: torch.Tensor, log_p: torch.Tensor, token_clip: float | 
     log_p = log_p.float()
     log_q = log_q.float()
     p = log_p.exp()
-    kld = p * (log_p - log_q)
+    positive = p > 0
+    delta = torch.where(positive, log_p - log_q, torch.zeros_like(log_p))
+    kld = p * delta
     if token_clip is not None:
         # Match official OPSD: cap positive pointwise terms, retain negative terms.
         kld = kld.clamp(max=token_clip)
@@ -193,11 +195,16 @@ def compute_forward_kl_topk(
     # form one coarse tail event.  This preserves probability mass and avoids
     # treating a truncated, unnormalised KL sum as a full forward KL.
     eps = torch.finfo(torch.float32).eps
-    teacher_tail = (1.0 - teacher_mass.float()).clamp(min=eps, max=1.0)
+    teacher_tail = (1.0 - teacher_mass.float()).clamp(min=0.0, max=1.0)
     if teacher_topk_ids.shape[-1] == student_logits.shape[-1]:
         tail_kl = torch.zeros_like(teacher_tail)
     else:
-        tail_kl = teacher_tail * (teacher_tail.log() - student_tail_log_probs)
+        # Exact zero for deterministic targets, including a zero student tail.
+        positive_tail = teacher_tail > 0
+        tail_delta = torch.where(
+            positive_tail, teacher_tail.clamp_min(eps).log() - student_tail_log_probs,
+            torch.zeros_like(student_tail_log_probs))
+        tail_kl = teacher_tail * tail_delta
     raw_distillation_losses = (raw_topk_kl + tail_kl).detach()
     # The omitted vocabulary is one coarse event in this implementation. Cap
     # that event too so the tail cannot bypass stabilization. This differs from

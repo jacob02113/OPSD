@@ -9,11 +9,48 @@ import copy
 import html
 
 from . import scene_graph as sg
+from .command_metrics import PROPOSAL_KINDS, PROPOSAL_METRICS, proposal_stats
 
 
 def reference(kind, box):
     x0, y0, x1, y1 = box
     return f'{sg.REF_START}{kind}{sg.REF_END}{sg.BOX_START}({x0},{y0}),({x1},{y1}){sg.BOX_END}'
+
+
+def ground_command(executor, panel):
+    """Render a GT grounding using registered student boxes, not GT references."""
+    g = executor.grounding_by_panel[panel]
+    caption, cursor, pieces = str(g.get('caption', '')), 0, []
+    indices = executor.ground_character_indices()
+    for mention in sorted(g.get('mentions', ()), key=lambda m: (m['start'], m['end'])):
+        start, end = int(mention['start']), int(mention['end'])
+        if not cursor <= start < end <= len(caption):
+            raise ValueError('Invalid grounding annotation')
+        pieces.extend([html.escape(caption[cursor:start], quote=False), sg.REF_START,
+                       html.escape(caption[start:end], quote=False), sg.REF_END])
+        for box in mention.get('character_bboxes', ()):
+            i = indices[sg._box(box)]
+            pieces.append(reference('character', executor.state.detected_characters[i]).split(sg.REF_END, 1)[1])
+        cursor = end
+    pieces.append(html.escape(caption[cursor:], quote=False))
+    return ('<ground>' + reference('panel', executor.target.panel_boxes[panel])
+            + '<text>' + ''.join(pieces) + '</text></ground>')
+
+
+def correct_content(executor, command):
+    """Correct only read/ground payloads; preserve the student's operation/head."""
+    if command.startswith('<read>'):
+        m = sg.READ_RE.fullmatch(command)
+        i = executor.resolve_reference(executor.state.text_by_student_box, sg._match_box(m, 1))
+        payload = html.escape(str(executor.target.texts[i].get('content', '')), quote=False)
+    elif command.startswith('<ground>'):
+        m = sg.GROUND_RE.fullmatch(command)
+        p = executor.resolve_reference(executor.panel_by_box, sg._match_box(m, 1))
+        payload = ground_command(executor, p).split('<text>', 1)[1].rsplit('</text>', 1)[0]
+    else:
+        return command
+    head, rest = command.split('<text>', 1)
+    return head + '<text>' + payload + '</text>' + rest.rsplit('</text>', 1)[1]
 
 
 def signature(executor, command):
@@ -69,19 +106,7 @@ def frontier(executor):
     for p, g in sorted(executor.grounding_by_panel.items()):
         if p >= s.entered or p in s.groundings or not executor._ground_required(p).issubset(s.detected_characters):
             continue
-        caption, cursor, pieces = str(g.get('caption', '')), 0, []
-        for mention in sorted(g.get('mentions', ()), key=lambda m: (m['start'], m['end'])):
-            start, end = int(mention['start']), int(mention['end'])
-            if not cursor <= start < end <= len(caption):
-                raise ValueError('Invalid grounding annotation')
-            pieces.extend([html.escape(caption[cursor:start], quote=False), sg.REF_START,
-                           html.escape(caption[start:end], quote=False), sg.REF_END])
-            for box in mention.get('character_bboxes', ()):
-                i = t.character_boxes.index(tuple(box))
-                pieces.append(reference('character', s.detected_characters[i]).split(sg.REF_END, 1)[1])
-            cursor = end
-        pieces.append(html.escape(caption[cursor:], quote=False))
-        candidates.append('<ground>' + reference('panel', t.panel_boxes[p]) + '<text>' + ''.join(pieces) + '</text></ground>')
+        candidates.append(ground_command(executor, p))
     return [c for c in candidates if signature(executor, c) is not None]
 
 

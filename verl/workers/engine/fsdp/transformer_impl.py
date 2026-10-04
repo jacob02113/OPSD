@@ -668,6 +668,41 @@ class FSDPEngine(BaseEngine):
         else:
             yield
 
+    def train_batch(self, data: TensorDict, loss_function: Callable):
+        # Replay only the first microbatch per rank, against the SAME prefixes.
+        # The baseline comes from the normal training forward, not a second pass.
+        self._action_pair_probe = None
+        self._capture_action_pair = True
+        try:
+            outputs = super().train_batch(data, loss_function)
+            probe = self._action_pair_probe
+            if probe is not None:
+                import time
+                from verl.trainer.distillation.action_diagnostics import paired_action_statistics
+                from verl.utils.metric import Metric, AggregationType
+                batch, before, cpu_rng, cuda_rng, cuda_device = probe
+                started = time.perf_counter()
+                devices = [cuda_device] if cuda_rng is not None else []
+                with torch.random.fork_rng(devices=devices), torch.no_grad():
+                    torch.set_rng_state(cpu_rng)
+                    if cuda_rng is not None:
+                        torch.cuda.set_rng_state(cuda_rng, cuda_device)
+                    _, post = self.forward_step(batch, loss_function=loss_function, forward_only=True)
+                after = post["model_output"]
+                stats = paired_action_statistics(before, after)
+                names = list(stats)
+                totals = torch.stack([stats[name] for name in names])
+                if self.is_mp_src_rank_with_outputs():
+                    for name, value in zip(names, totals.cpu().tolist()):
+                        outputs["metrics"]["manga_action_paired/" + name] = Metric(
+                            aggregation=AggregationType.SUM, value=value)
+                    outputs["metrics"]["manga_action_paired/seconds"] = Metric(
+                        aggregation=AggregationType.MAX, value=time.perf_counter() - started)
+            return outputs
+        finally:
+            self._action_pair_probe = None
+            self._capture_action_pair = False
+
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> list[TensorDict]:
         # note that the global_batch_size should include data on all the dp
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
@@ -680,6 +715,25 @@ class FSDPEngine(BaseEngine):
         )
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
+        if 'manga_single_mask' in data:
+            counts = torch.stack([data['manga_single_mask'].values().sum(),
+                                  data['manga_multi_mask'].values().sum(),
+                                  (data['manga_action_ids_0'].values() >= 0).sum()]).to(get_device_id()).float()
+            if 'manga_group_weights' in data:
+                counts = torch.cat((counts, data['manga_group_weights'].values().sum(0).to(get_device_id())))
+            torch.distributed.all_reduce(counts, group=self.get_data_parallel_group())
+            totals = counts.tolist()
+            tu.assign_non_tensor(data, manga_single_batch_count=totals[0],
+                                 manga_multi_batch_count=totals[1], manga_action_batch_count=totals[2])
+            if len(totals) == 6:
+                # Global denominators are scalars, not per-example lists.
+                tu.assign_non_tensor(data, manga_action_group_count=totals[3],
+                                     manga_object_group_count=totals[4], manga_content_group_count=totals[5])
+        elif "manga_action_ids_0" in data:
+            action_count = (data["manga_action_ids_0"].values() >= 0).sum().to(get_device_id())
+            torch.distributed.all_reduce(action_count, group=self.get_data_parallel_group())
+            tu.assign_non_tensor(data, manga_action_batch_count=action_count.item())
+
 
         micro_batches, indices = prepare_micro_batches(
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
@@ -699,9 +753,21 @@ class FSDPEngine(BaseEngine):
                 if forward_only
                 else self._gradient_sync_context(is_last_micro_batch=micro_batch_idx == len(micro_batches) - 1)
             )
+            capture_action_pair = (getattr(self, "_capture_action_pair", False)
+                                   and not forward_only and micro_batch_idx == 0
+                                   and "manga_action_ids_0" in micro_batch)
+            if capture_action_pair:
+                cpu_rng = torch.get_rng_state()
+                cuda_device = torch.cuda.current_device() if torch.cuda.is_available() else None
+                cuda_rng = torch.cuda.get_rng_state(cuda_device) if cuda_device is not None else None
             with ctx, sync_ctx:
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
 
+                if capture_action_pair:
+                    before = {name: value.values().detach().cpu().clone()
+                              for name, value in meta_info["model_output"].items()
+                              if name.startswith("action_")}
+                    self._action_pair_probe = (micro_batch, before, cpu_rng, cuda_rng, cuda_device)
                 if not forward_only:
                     if scaler is not None:
                         scaler.scale(loss).backward()
@@ -1500,9 +1566,6 @@ class FSDPEngineWithLMHead(FSDPEngine):
             from verl.trainer.distillation.losses import _response_mask_to_causal_input_mask
             causal_mask = _response_mask_to_causal_input_mask(
                 micro_batch["manga_opsd_mask"], micro_batch["input_ids"]).values()
-            if "manga_boundary_mask" in micro_batch:
-                causal_mask = causal_mask | _response_mask_to_causal_input_mask(
-                    micro_batch["manga_boundary_mask"], micro_batch["input_ids"]).values()
             predictors = causal_mask.nonzero(as_tuple=True)[0]
             model_inputs["opsd_predictor_indices"] = predictors
         if "manga_tree_layout" in micro_batch:

@@ -1699,6 +1699,8 @@ class RayPPOTrainer:
                             self.checkpoint_manager.update_weights(self.global_steps)
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        from verl.trainer.manga.command_metrics import add_proposal_rates
+                        add_proposal_rates(actor_output_metrics)
                         metrics.update(actor_output_metrics)
 
                     # Log rollout generations if enabled
@@ -1771,6 +1773,10 @@ class RayPPOTrainer:
                 )
 
                 # TODO: make a canonical logger that supports various backend
+                from verl.trainer.manga.log_metrics import compact_manga_metrics
+                compact_manga_metrics(metrics)
+                from verl.trainer.distillation.action_diagnostics import add_action_diagnostic_rates
+                add_action_diagnostic_rates(metrics)
                 logger.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)

@@ -124,6 +124,10 @@ def construct_minimal_padding_template(
     ):
         if key in template_sample:
             template_sample[key] = torch.zeros_like(response_mask, dtype=torch.float32)
+    for i in range(5):
+        key = f"manga_action_ids_{i}"
+        if key in template_sample:
+            template_sample[key] = torch.full_like(response_mask, -1, dtype=torch.long)
     if "manga_tree_layout" in template_sample:
         template_sample["manga_tree_layout"] = torch.tensor([[0, 0, 2]], dtype=torch.long)
     if "manga_command_types" in template_sample:

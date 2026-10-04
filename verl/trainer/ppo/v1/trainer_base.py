@@ -514,6 +514,10 @@ class PPOTrainer(ABC):
             tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
 
             dapo_filtered_reward_counts = metrics.pop(DAPO_FILTERED_REWARD_COUNTS_KEY, None)
+            from verl.trainer.manga.log_metrics import compact_manga_metrics
+            compact_manga_metrics(metrics)
+            from verl.trainer.distillation.action_diagnostics import add_action_diagnostic_rates
+            add_action_diagnostic_rates(metrics)
             self.logger.log(data=metrics, step=self.global_steps)
             if dapo_filtered_reward_counts:
                 self.dapo_filtered_reward_logger.log(
@@ -565,6 +569,8 @@ class PPOTrainer(ABC):
             combined_partition_id = batch.partition_id
 
         metrics.update(metrics_aggregator.get_aggregated_metrics())
+        from verl.trainer.manga.command_metrics import add_proposal_rates
+        add_proposal_rates(metrics)
         return KVBatchMeta(partition_id=combined_partition_id, keys=combined_keys, tags=combined_tags)
 
     def _step_once(self, metrics: dict, timing_raw: dict, sample_batch_size: int) -> KVBatchMeta:

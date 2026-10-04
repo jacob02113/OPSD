@@ -146,7 +146,9 @@ class AgentLoopOutput(BaseModel):
             output["extra_fields"].pop("teacher_ids", None),
             output["extra_fields"].pop("teacher_logprobs", None),
         )
-        opsd_fields = ("manga_delimiter_mask", "manga_opsd_mask", "manga_boundary_mask", "manga_boundary_stats", "manga_command_types", "manga_command_starts", "manga_command_stats", "manga_intent_stats", "manga_tree_layout")
+        opsd_fields = ("manga_delimiter_mask", "manga_opsd_mask", "manga_boundary_mask", "manga_boundary_stats", "manga_command_types", "manga_command_starts", "manga_command_stats", "manga_intent_stats", "manga_tree_layout") + tuple(f"manga_action_ids_{i}" for i in range(5))
+        opsd_fields += ("manga_group_weights", "manga_single_mask", "manga_multi_mask", "manga_correct_edges", "manga_content_corrections",
+                        "manga_approx_mask", "manga_candidate_edges", "manga_candidate_teacher_mass", "manga_preference_edges")
         if teacher_ids is not None:
             output["teacher_ids"] = teacher_ids
         if teacher_logprobs is not None:

@@ -15,6 +15,11 @@ enabled: false
 
 # Teacher command correction on unchanged student histories.
 manga_opsd_enabled: false
+# Mean illegal action probability, added to the original KL.
+manga_action_illegal_weight: 1.0
+# Action-set NLL + conditional preference; object KL; deterministic content CE.
+manga_correctness_loss: false
+manga_preference_weight: 0.1
 manga_target_key: target_json
 manga_entity_iou_threshold: 0.5
 manga_teacher_max_inflight: 4

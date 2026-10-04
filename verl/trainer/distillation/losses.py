@@ -210,24 +210,30 @@ def compute_topk_loss(
         case _:
             raise NotImplementedError(f"Unsupported strategy: {config.strategy=}")
 
-    outputs = distillation_loss_fn(
-        student_logits=student_logits,
-        teacher_topk_log_probs=data["teacher_logprobs"],
-        teacher_topk_ids=data["teacher_ids"],
-        config=distillation_config,
-        data_format=data_format,
-        token_mask=token_mask,
-        **({"student_positions": student_positions} if student_positions is not None else {}),
-    )
+    normalizers = None
+    if distillation_config.manga_opsd_enabled and distillation_config.manga_correctness_loss:
+        if config.strategy not in ('fsdp', 'fsdp2', 'veomni'):
+            raise ValueError('Manga correctness loss requires the FSDP sparse projection path')
+        from verl.trainer.distillation.correctness_loss import correctness_loss_outputs
+        outputs, normalizers = correctness_loss_outputs(data, student_logits, token_mask, student_positions,
+            distillation_config.manga_preference_weight)
+    else:
+        outputs = distillation_loss_fn(
+            student_logits=student_logits,
+            teacher_topk_log_probs=data["teacher_logprobs"],
+            teacher_topk_ids=data["teacher_ids"],
+            config=distillation_config,
+            data_format=data_format,
+            token_mask=token_mask,
+            **({"student_positions": student_positions} if student_positions is not None else {}),
+        )
 
-    if "manga_boundary_mask" in data:
-        from verl.trainer.manga.boundary import boundary_cross_entropy
-        from verl.utils.ulysses import get_ulysses_sequence_parallel_world_size
-        if data_format != "thd" or get_ulysses_sequence_parallel_world_size() != 1:
-            raise ValueError("Boundary CE requires packed linear FSDP with SP=1")
-        boundary_mask = _response_mask_to_causal_input_mask(data["manga_boundary_mask"], data["input_ids"])
-        outputs["boundary_losses"], outputs["boundary_correct"] = boundary_cross_entropy(
-            student_logits, data["input_ids"].values(), boundary_mask.values(), student_positions)
+    if "manga_action_ids_0" in data:
+        from verl.trainer.distillation.action_diagnostics import action_diagnostics
+        outputs.update(action_diagnostics(data, student_logits, student_positions,
+            train_legality=(not distillation_config.manga_correctness_loss
+                            and distillation_config.manga_action_illegal_weight > 0),
+            log_normalizers=normalizers))
 
     expected_shape = (1, data["input_ids"].values().numel()) if student_positions is not None else student_logits.shape[:2]
     for k, v in outputs.items():
@@ -310,7 +316,7 @@ def _padded(value: torch.Tensor, padding_value: float | bool = 0.0) -> torch.Ten
 
 
 def _manga_opsd_loss(config, data, distill, topk_metrics):
-    """Content forward KL; boundary CE is added separately."""
+    """Unified forward KL for command, structural, and boundary tokens."""
     mask = _padded(data["manga_opsd_mask"], False).bool()
     loss = agg_loss(loss_mat=distill, loss_mask=mask,
                     loss_agg_mode=config.loss_agg_mode, **config.global_batch_info)
@@ -341,7 +347,8 @@ def _manga_opsd_loss(config, data, distill, topk_metrics):
                  "fallback_direct_target", "fallback_dag_prerequisite",
                  "fallback_unmatched_target_fallback", "fallback_completed_target_fallback",
                  "student_forced_tokens", "teacher_image_preprocess_reused",
-                 "teacher_submissions_during_preparation")
+                 "teacher_submissions_during_preparation", "repair_no_progress", "repair_round_limit",
+                 "repair_token_budget", "repair_generated_tokens")
         for i, name in enumerate(names):
             metrics[f"manga_intent/{name}"] = Metric(value=stats[:, i].sum(), aggregation=AggregationType.SUM)
         totals = {name: stats[:, i].sum() for i, name in enumerate(names)}
@@ -369,7 +376,16 @@ def _manga_opsd_loss(config, data, distill, topk_metrics):
                     value=distill.detach()[selected].sum() / selected.sum().clamp_min(1),
                     aggregation=AggregationType.MEAN)
         metrics["manga_command/enter_dependency_blocked"] = Metric(
-            value=stats[:, -1].sum(), aggregation=AggregationType.SUM)
+            value=stats[:, 20].sum(), aggregation=AggregationType.SUM)
+        from verl.trainer.manga.command_metrics import (
+            PROPOSAL_KINDS, PROPOSAL_METRICS, PROPOSAL_STATS_OFFSET,
+        )
+        if stats.shape[1] >= PROPOSAL_STATS_OFFSET + len(PROPOSAL_KINDS) * len(PROPOSAL_METRICS):
+            for i, kind in enumerate(PROPOSAL_KINDS):
+                for j, name in enumerate(PROPOSAL_METRICS):
+                    index = PROPOSAL_STATS_OFFSET + i * len(PROPOSAL_METRICS) + j
+                    metrics[f"manga_command/{kind}_{name}"] = Metric(
+                        value=stats[:, index].sum(), aggregation=AggregationType.SUM)
     from verl.trainer.manga.diagnostics import record_opsd_actor
     record_opsd_actor(data, distill)
     return loss, metrics
@@ -381,24 +397,85 @@ def manga_opsd_loss(
     model_output: dict,
     data: TensorDict,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Command-boundary forward KL on original and teacher-generated corrective tokens."""
+    """Correctness objectives or legacy forward KL, sharing command diagnostics."""
 
     config.global_batch_info["dp_size"] = data["dp_size"]
     config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
     config.global_batch_info["global_batch_size"] = data["global_batch_size"]
     config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
     distill, topk_metrics = compute_forward_kl_topk(config, distillation_config, model_output, data)
-    loss, metrics = _manga_opsd_loss(config, data, distill, topk_metrics)
+    loss, metrics = _manga_opsd_loss(config, data,
+        distill.detach() if distillation_config.manga_correctness_loss else distill, topk_metrics)
+    if distillation_config.manga_correctness_loss:
+        # These values are no longer all-token KL/top-k mass. Keep log names
+        # explicit so historical KL curves are not compared to composite loss.
+        for key in list(metrics):
+            if key.startswith('manga_command/') and key.endswith('_kl'):
+                metrics[key[:-3] + '_loss'] = metrics.pop(key)
+        for old, new in (
+            ('manga_opsd/opsd_loss', 'manga_correctness/token_loss'),
+            ('distillation/student_mass', 'manga_correctness/student_target_mass'),
+            ('distillation/student_mass_min', 'manga_correctness/student_target_mass_min'),
+            ('distillation/teacher_mass', 'manga_correctness/teacher_retained_mass'),
+            ('distillation/teacher_mass_min', 'manga_correctness/teacher_retained_mass_min')):
+            if old in metrics:
+                metrics[new] = metrics.pop(old)
+        # Equal group weights; object rows already carry reciprocal per-object
+        # token counts. Global denominators keep DP/microbatch splits invariant.
+        parts = []
+        for index, group in enumerate(('action', 'object', 'content')):
+            count = float(data[f'manga_{group}_group_count'])
+            part = model_output['manga_group_' + group].values().sum() / max(count, 1.) * data['dp_size']
+            parts.append(part)
+            metrics['manga_groups/' + group + '_loss'] = Metric(
+                value=part.detach(), aggregation=AggregationType.SUM)
+            metrics['manga_groups/' + group + '_count'] = Metric(
+                value=data['manga_group_weights'].values()[:, index].sum(), aggregation=AggregationType.SUM)
+        loss = sum(parts)
+        for name in ('correctness', 'preference'):
+            key = 'manga_action_' + name
+            if key in model_output:
+                metrics['manga_groups/action_' + name + '_loss'] = Metric(
+                    value=model_output[key].values().detach().sum()
+                        / max(float(data['manga_action_group_count']), 1.) * data['dp_size'],
+                    aggregation=AggregationType.SUM)
+        metrics['manga_correctness/single_tokens'] = Metric(
+            value=data['manga_single_mask'].values().sum(), aggregation=AggregationType.SUM)
+        metrics['manga_correctness/multi_tokens'] = Metric(
+            value=data['manga_multi_mask'].values().sum(), aggregation=AggregationType.SUM)
+        metrics['manga_correctness/content_corrected'] = Metric(
+            value=data['manga_content_corrections'].values().sum(), aggregation=AggregationType.SUM)
+    if 'manga_candidate_rows' in model_output:
+        # Ratios of globally aggregated SUMs can be read without averaging page means.
+        for name in ('rows', 'unchecked'):
+            metrics['manga_candidates/' + name + '_sum'] = Metric(
+                value=model_output['manga_candidate_' + name].values().detach().sum(),
+                aggregation=AggregationType.SUM)
+        metrics['manga_candidates/teacher_observed_legal_mass_sum'] = Metric(
+            value=data['manga_candidate_teacher_mass'].values().sum(), aggregation=AggregationType.SUM)
+        metrics['manga_candidates/checked_tokens_sum'] = Metric(
+            value=data['manga_candidate_edges'].values().shape[0], aggregation=AggregationType.SUM)
+    weight = distillation_config.manga_action_illegal_weight
+    if weight > 0 and not distillation_config.manga_correctness_loss:
+        if "action_illegal_loss" not in model_output:
+            raise ValueError("Action legality loss requires rollout action supports")
+        count = data["manga_action_batch_count"]
+        penalty = model_output["action_illegal_loss"].values().sum() / max(float(count), 1.) * data["dp_size"]
+        loss = loss + weight * penalty
+        metrics["manga_action_loss/contribution"] = Metric(value=weight * penalty.detach(), aggregation=AggregationType.SUM)
+    if "action_rows" in model_output:
+        # SUMs give exact token-weighted means across microbatches and DP ranks:
+        # divide by rows (or valid_rows for preference_kl/total_kl).
+        for name in ("rows", "legal_mass", "legality_nll", "preference_kl", "total_kl", "teacher_support_mass", "valid_rows"):
+            values = no_padding_2_padding(model_output["action_" + name], data)
+            metrics["manga_action_pre_update/" + name + ("" if name.endswith("rows") else "_sum")] = Metric(
+                value=values.detach().sum(), aggregation=AggregationType.SUM)
+
     if "manga_boundary_mask" in data:
         mask = _padded(data["manga_boundary_mask"], False).bool()
-        ce = no_padding_2_padding(model_output["boundary_losses"], data)
-        correct = no_padding_2_padding(model_output["boundary_correct"], data)
-        loss = loss + agg_loss(loss_mat=ce, loss_mask=mask,
-                              loss_agg_mode=config.loss_agg_mode, **config.global_batch_info)
-        metrics["manga_boundary/ce"] = Metric(
-            value=(ce.detach() * mask).sum() / mask.sum().clamp_min(1), aggregation=AggregationType.MEAN)
-        metrics["manga_boundary/accuracy"] = Metric(
-            value=(correct * mask).sum() / mask.sum().clamp_min(1), aggregation=AggregationType.MEAN)
+        metrics["manga_boundary/kl"] = Metric(
+            value=(distill.detach() * mask).sum() / mask.sum().clamp_min(1),
+            aggregation=AggregationType.MEAN)
         metrics["manga_boundary/tokens"] = Metric(value=mask.sum(), aggregation=AggregationType.SUM)
         stats = _padded(data["manga_boundary_stats"])
         for i, name in enumerate(("student_requests", "early_eos", "continue_boundaries", "continue_errors",

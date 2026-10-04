@@ -162,23 +162,19 @@ def selected_prompt_logprobs(runner, hidden_states, num_scheduled_tokens):
                 legal_mass = probabilities.logsumexp(-1)
             else:
                 probabilities = runner.sampler.compute_logprobs(logits)
-            # Calibrate full-vocabulary action probabilities BEFORE top-k.
-            # Applying the same floor to each component guarantees it for their
-            # equal-weight mixture, while preserving within-set preferences.
+            # v4.9.2 action calibration path, with legal mass now exactly one.
+            # Only the few action rows are touched; object/content rows stay raw.
             for row_index, entry in enumerate(chunk):
                 support = entry[5]
                 if not support:
                     continue
-                legal = torch.zeros(probabilities.shape[-1], dtype=torch.bool, device=probabilities.device)
-                legal[support] = True
                 row = probabilities[row_index]
-                log_yes = row[legal].logsumexp(0)
-                log_no = row[~legal].logsumexp(0)
-                floor = row.new_tensor(0.9).log()
-                adjust = log_yes < floor
-                yes_delta = torch.where(adjust, floor-log_yes, row.new_zeros(()))
-                no_delta = torch.where(adjust, row.new_tensor(0.1).log()-log_no, row.new_zeros(()))
-                probabilities[row_index] = row + torch.where(legal, yes_delta, no_delta)
+                keep = row[support]
+                keep = keep - keep.logsumexp(0)
+                row.fill_(-torch.inf)
+                row[support] = keep
+                if raw_mode:
+                    legal_mass[row_index] = 0.
             target = torch.tensor([entry[3] for entry in chunk], device=hidden_states.device)
             token_ids, logprobs, ranks = runner.sampler.gather_logprobs(probabilities, k, target)[:3]
             if raw_mode:

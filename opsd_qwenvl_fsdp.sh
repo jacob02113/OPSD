@@ -5,7 +5,7 @@ set -xeuo pipefail
 export NCCL_IB_DISABLE=1
 export CUDA_HOME="$CONDA_PREFIX"
 
-STUDENT_MODEL=${STUDENT_MODEL:-models/Qwen3-VL-4B-DSL-SFT-v3.1-e1}
+STUDENT_MODEL=${STUDENT_MODEL:-/hdd/u202212063031/magi/Qwen3-VL/models/Qwen3-VL-4B-DSL-SFT-v3.1-e1}
 TRAIN_FILE=${TRAIN_FILE:-data/train.parquet}
 VAL_FILE=${VAL_FILE:-data/val.parquet}
 PROMPT_KEY=${PROMPT_KEY:-prompt}
@@ -37,6 +37,9 @@ ENTITY_IOU_THRESHOLD=${ENTITY_IOU_THRESHOLD:-0.5}
 MANGA_MAX_COMMANDS=${MANGA_MAX_COMMANDS:-256}
 OLD_LOG_PROB_ENTROPY=${OLD_LOG_PROB_ENTROPY:-False}
 ACTOR_LR=${ACTOR_LR:-1e-6}
+MANGA_ACTION_ILLEGAL_WEIGHT=${MANGA_ACTION_ILLEGAL_WEIGHT:-1.0}
+MANGA_CORRECTNESS_LOSS=${MANGA_CORRECTNESS_LOSS:-True}
+MANGA_PREFERENCE_WEIGHT=${MANGA_PREFERENCE_WEIGHT:-0.2}
 PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}
 PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}
 
@@ -51,7 +54,7 @@ TOTAL_EPOCHS=${TOTAL_EPOCHS:-1}
 SAVE_FREQ=${SAVE_FREQ:-16}
 TEST_FREQ=${TEST_FREQ:--1}
 PROJECT_NAME=${PROJECT_NAME:-mangatrace}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-mangatrace_a_opsd_v4.9.2}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-mangatrace_a_opsd_v4.9.7}
 SAVE_STUDENT_ROLLOUTS=${SAVE_STUDENT_ROLLOUTS:-False}
 
 rollout_max_model_len=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH + 1))
@@ -122,6 +125,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.agent.default_agent_loop=manga_corrective_opsd_agent \
     distillation.enabled=True \
     distillation.manga_opsd_enabled=True \
+    distillation.manga_action_illegal_weight=$MANGA_ACTION_ILLEGAL_WEIGHT \
+    distillation.manga_correctness_loss=$MANGA_CORRECTNESS_LOSS \
+    distillation.manga_preference_weight=$MANGA_PREFERENCE_WEIGHT \
     distillation.n_gpus_per_node=$TEACHER_NGPUS_PER_NODE \
     distillation.nnodes=$TEACHER_NNODES \
     distillation.manga_teacher_max_inflight=$MANGA_TEACHER_MAX_INFLIGHT \
