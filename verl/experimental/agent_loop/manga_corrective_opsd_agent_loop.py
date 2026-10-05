@@ -183,7 +183,7 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
 
     async def _score_branch(self, *, start, branch, teacher_prompt, image, mm_kwargs,
                             routing_key, history, command, legal, reason, expected,
-                            counters, semaphore, student_prompt_ids=None, student_route=None):
+                            counters, semaphore, student_prompt_ids=None, student_route=None, repair_support=None):
         contexts = teacher_prompt
         # Warm only the original-image history, before the appended thumbnail.
         # Different thumbnail hashes must never contaminate the shared prefix.
@@ -299,6 +299,10 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
             await asyncio.gather(*ready_jobs, return_exceptions=True)
             raise
 
+        object_positions = [i for i, mask in enumerate(masks) if mask is None]
+        repair_support = (repair_support or {}) if getattr(self, 'correctness_loss', False) else {}
+        for position, allowed in repair_support.items():
+            masks[position] = allowed
         # Preserve the full readiness barrier and length preflight, but overlap
         # support construction with image/prompt preparation rather than serializing.
         await asyncio.gather(*(c['ready'] for c in contexts))
@@ -323,6 +327,8 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
             action_support = {str(positions[i]): mask for i, mask in action_rows.items()}
             pending = []
             for i, mask in enumerate(masks):
+                if i in repair_support:
+                    continue
                 if component_index not in active_rows[i]:
                     continue
                 if isinstance(mask, list) and len(mask) == 1:
@@ -403,6 +409,11 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
             out_ids, out_logs = [], []
             deterministic_cache = {}
             for position in range(len(branch)):
+                if position in repair_support:
+                    # Placeholder only: executor NLL replaces teacher KL here.
+                    ids, logs, _ = mix_sparse([([branch[position]], [0.])], [1.], self.topk)
+                    out_ids.append(ids); out_logs.append(logs)
+                    continue
                 if isinstance(masks[position], list) and len(masks[position]) == 1:
                     token = masks[position][0]
                     if token not in deterministic_cache:
@@ -433,7 +444,8 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
                         teacher_logprobs=torch.tensor(out_logs, dtype=torch.float32))
             if getattr(self, 'correctness_loss', False):
                 output['correct_support'] = masks
-                output['object_positions'] = [i for i, mask in enumerate(masks) if mask is None]
+                output['object_positions'] = object_positions
+                output['repair_positions'] = list(repair_support)
             return output, deltas
         output, deltas = await self.loop.run_in_executor(None, aggregate)
         counters.update(deltas)
@@ -592,6 +604,12 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
                 if stagnant >= 4:
                     return bounded_fallback('no_progress')
             rounds += 1
+            # Capture exact raw predictor tokens BEFORE sampling applies its mask.
+            # Only actual rejected tokens qualify; truncated payloads do not.
+            if len(prefix) < len(raw_ids) and raw_ids[len(prefix)] not in allowed:
+                if not hasattr(self, '_repair_records'):
+                    self._repair_records = []
+                self._repair_records.append((tuple(history + prefix), tuple(allowed)))
             if len(allowed) == 1:
                 chosen = allowed
                 counters['student_forced_tokens'] += 1
@@ -721,6 +739,7 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
                     counters["terminal_errors"] += int(not ended or bool(command))
                     set_response(response_text + assistant_suffix)
                     break
+                self._repair_records = []
                 original_command = command
                 # Inspect the unmodified proposal, before EOS recovery or repair.
                 proposal_kind = executor.action_kind(original_command)
@@ -826,13 +845,19 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
                 _, _, _, _, teacher_prompt = await context_job
                 context_job = None
                 branch_content = next_commands[-1]["branch"]
+                from verl.trainer.manga.repair_supervision import align_repairs
+                repair_support, rejected = align_repairs(
+                    getattr(self, '_repair_records', ()), next_ids,
+                    next_commands[-1]['start'], len(branch_content))
+                counters['repair_supervision_dropped'] += rejected
+                counters['repair_supervision_recorded'] += len(getattr(self, '_repair_records', ()))
                 branch_job = asyncio.create_task(self._score_branch(
                     start=next_commands[-1]["start"], branch=branch_content,
                     teacher_prompt=teacher_prompt, image=image, mm_kwargs=mm_kwargs,
                     routing_key=routing, history=list(next_ids[:next_commands[-1]["start"]]), command=command,
                     legal=legal, reason=reason, expected=expected,
                     counters=counters, semaphore=semaphore,
-                    student_prompt_ids=prompt_ids, student_route=route_id))
+                    student_prompt_ids=prompt_ids, student_route=route_id, repair_support=repair_support))
                 score_jobs.append(branch_job)
                 # Length preflight gates acceptance, not ready-component submission.
                 await asyncio.gather(*(c['ready'] for c in teacher_prompt))
@@ -966,6 +991,7 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
         command_starts = [False] * len(response)
         action_ids = [[-1] * len(response) for _ in range(5)]
         single_mask, multi_mask, correct_edges = [False] * len(response), [False] * len(response), []
+        repair_mask = [False] * len(response)
         group_weights = [[0., 0., 0.] for _ in response]
         kinds = ("enter", "detect", "read", "link", "ground")
         for item in commands:
@@ -978,6 +1004,8 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
                 command_types[start:start + size] = [kinds.index(kind) + 1] * size
             command_starts[start] = True
             if getattr(self, 'correctness_loss', False):
+                for offset in item.get('repair_positions', ()):
+                    repair_mask[start + offset] = True
                 supports = item['correct_support']
                 if len(supports) != size:
                     raise ValueError('Correctness supports must cover the whole command')
@@ -1047,7 +1075,10 @@ class MangaCorrectiveOPSDLoop(AgentLoopBase):
             precomputed_multi_modal_inputs=self.precomputed_multi_modal_inputs,
             extra_fields={
                 "teacher_ids": ids, "teacher_logprobs": logprobs,
-                **({"manga_group_weights": torch.tensor(group_weights, dtype=torch.float32),
+                **({"manga_repair_stats": torch.tensor([counters['repair_supervision_recorded'],
+                        counters['repair_supervision_dropped']], dtype=torch.long),
+                    "manga_repair_mask": torch.tensor(repair_mask, dtype=torch.bool),
+                    "manga_group_weights": torch.tensor(group_weights, dtype=torch.float32),
                     "manga_single_mask": torch.tensor(single_mask, dtype=torch.bool),
                     "manga_multi_mask": torch.tensor(multi_mask, dtype=torch.bool),
                     "manga_content_corrections": torch.tensor([counters['content_corrected']], dtype=torch.long),

@@ -445,6 +445,15 @@ def manga_opsd_loss(
             value=data['manga_multi_mask'].values().sum(), aggregation=AggregationType.SUM)
         metrics['manga_correctness/content_corrected'] = Metric(
             value=data['manga_content_corrections'].values().sum(), aggregation=AggregationType.SUM)
+    if 'manga_repair_stats' in data:
+        stats = data['manga_repair_stats'].values().reshape(-1, 2)
+        for index, name in enumerate(('recorded', 'dropped')):
+            metrics['manga_repair/' + name] = Metric(value=stats[:, index].sum(), aggregation=AggregationType.SUM)
+    if 'manga_repair_rows' in model_output:
+        for name in ('rows', 'nll', 'mass'):
+            metrics['manga_repair/' + name + '_sum'] = Metric(
+                value=model_output['manga_repair_' + name].values().detach().sum(),
+                aggregation=AggregationType.SUM)
     if 'manga_candidate_rows' in model_output:
         # Ratios of globally aggregated SUMs can be read without averaging page means.
         for name in ('rows', 'unchecked'):

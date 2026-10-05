@@ -85,7 +85,7 @@ def selected_token_losses(logits, targets, single, multi, edge_rows, edge_ids, t
 
 
 def task_token_losses(logits, targets, single, multi, objects, edge_rows, edge_ids,
-                      teacher_ids, teacher_logs, preference_weight):
+                      teacher_ids, teacher_logs, preference_weight, repair=None):
     """Exact action-set NLL; object top-k+tail forward KL; singleton content CE.
 
     Object tail is one coarse event over the remaining full vocabulary. No
@@ -95,6 +95,8 @@ def task_token_losses(logits, targets, single, multi, objects, edge_rows, edge_i
     ce = torch.where(single, normalizer - logits.gather(1, targets[:, None]).squeeze(1).float(), 0.)
     edge_logs = logits[edge_rows, edge_ids].float() - normalizer[edge_rows]
     logz = segment_logsumexp(edge_logs, edge_rows, logits.shape[0])
+    repair = torch.zeros_like(multi) if repair is None else repair
+    objects = objects & ~repair
     actions = multi & ~objects
     set_loss = torch.where(actions, -logz.clamp_max(0.), 0.)
     preference = normalizer * 0.
@@ -120,7 +122,7 @@ def task_token_losses(logits, targets, single, multi, objects, edge_rows, edge_i
         # Action supports are exact and fully returned by the teacher.
         conditional = logp - torch.where(is_object, 0., logz[selected])[:, None]
         pref = (q * torch.where(observed, logq - conditional, 0.)).sum(-1)
-        preference = preference.index_copy(0, selected, torch.where(is_object, 0., pref))
+        preference = preference.index_copy(0, selected, torch.where(is_object | repair[selected], 0., pref))
         mass = mass.index_copy(0, selected, torch.where(is_object, pmass_log.exp(), logz[selected].exp()))
         teacher_mass = teacher_mass.index_copy(0, selected, qmass)
     composite = ce + set_loss + preference_weight * preference + object_kl
@@ -160,9 +162,13 @@ def correctness_loss_outputs(data, student_logits, token_mask, student_positions
         weights = rows.new_zeros((selected.numel(), 3), dtype=torch.float32)
         weights[response_causal] = data['manga_group_weights'].values().float()
         object_rows = weights[causal, 1] > 0
+        repairs = torch.zeros_like(selected)
+        if 'manga_repair_mask' in data:
+            repairs[response_causal] = data['manga_repair_mask'].values().bool()
+
         results = task_token_losses(rows, targets, single[causal], multi[causal], object_rows,
             edge_rows, entries[:, 1], data['teacher_ids'].values()[teacher_causal].long(),
-            data['teacher_logprobs'].values()[teacher_causal].float(), preference_weight)
+            data['teacher_logprobs'].values()[teacher_causal].float(), preference_weight, repairs[causal])
         ce, set_loss, preference, mass, teacher_mass, normalizer, composite = results
     else:
         pref_rows = pref_ids = None
@@ -183,6 +189,13 @@ def correctness_loss_outputs(data, student_logits, token_mask, student_positions
         manga_single_ce=scatter(ce), manga_set_loss=scatter(set_loss),
         manga_preference_kl=scatter(preference))
     if weights is not None:
+        output['manga_repair_nll'] = scatter(torch.where(repairs[causal], ce + set_loss, 0.))
+        output['manga_repair_mass'] = scatter(torch.where(repairs[causal], mass.detach(), 0.))
+        output['manga_repair_rows'] = scatter(repairs[causal].float())
+        # Reuse the existing paired first-microbatch replay, no extra forward.
+        for name in ('rows', 'mass', 'nll'):
+            output['action_repair_' + name] = output['manga_repair_' + name]
+
         output['manga_action_correctness'] = scatter((ce + set_loss) * weights[causal, 0])
         output['manga_action_preference'] = scatter(preference_weight * preference * weights[causal, 0])
         for index, group in enumerate(('action', 'object', 'content')):

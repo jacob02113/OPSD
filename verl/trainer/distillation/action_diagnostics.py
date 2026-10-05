@@ -55,6 +55,8 @@ def action_diagnostics(data, logits, student_positions=None, train_legality=Fals
     # Only call this an exact decomposition when the sparse teacher contains
     # the complete action distribution. Report coverage for every action row.
     exact = (mass - 1).abs() <= 1e-5
+    if 'manga_repair_mask' in data:
+        exact = exact & ~data['manga_repair_mask'].values().bool()[selected]
     q = q / mass.clamp_min(1e-30)[:, None]
     logconditional = (logp - logz[:, None]).masked_fill(~valid, 0.)
     preference = (q * (q.clamp_min(1e-30).log() - logconditional)).sum(-1)
@@ -70,6 +72,12 @@ def action_diagnostics(data, logits, student_positions=None, train_legality=Fals
 def add_action_diagnostic_rates(metrics):
     """Run after worker aggregation; avoid averaging unequal microbatch means."""
     add_paired_action_rates(metrics)
+    prefix = 'actor/manga_repair/'
+    count = metrics.get(prefix + 'rows_sum', 0.)
+    if prefix + 'rows_sum' in metrics:
+        for name in ('nll', 'mass'):
+            metrics[prefix + name] = metrics[prefix + name + '_sum'] / count if count else 0.
+
     candidates = 'actor/manga_candidates/'
     count = metrics.get(candidates + 'rows_sum', 0.)
     if candidates + 'rows_sum' in metrics:
@@ -110,6 +118,13 @@ def paired_action_statistics(before, after, tolerance=1e-5):
     for label, mask in (("low", pre < .5), ("high", pre >= .9)):
         stats[label + "_rows"] = mask.float().sum()
         stats[label + "_delta_sum"] = delta[mask].sum()
+    if 'action_repair_rows' in before and 'action_repair_rows' in after:
+        if not torch.equal(before['action_repair_rows'], after['action_repair_rows']):
+            raise ValueError('Repair predictors changed during replay')
+        stats['repair_rows'] = before['action_repair_rows'].sum()
+        for side, values in (('before', before), ('after', after)):
+            for name in ('mass', 'nll'):
+                stats[side + '_repair_' + name + '_sum'] = values['action_repair_' + name].sum()
     return stats
 
 
@@ -123,7 +138,12 @@ def add_paired_action_rates(metrics):
               for side in ("before", "after") for name in ("mass", "nll")]
     pairs += [(side + "_preference", side + "_preference_sum", "valid_rows") for side in ("before", "after")]
     pairs += [(group + "_delta", group + "_delta_sum", group + "_rows") for group in ("low", "high")]
+    pairs += [(side + '_repair_' + name, side + '_repair_' + name + '_sum', 'repair_rows')
+              for side in ('before', 'after') for name in ('mass', 'nll')
+              if prefix + side + '_repair_' + name + '_sum' in metrics]
     for output, numerator, denominator in pairs:
         count = metrics[prefix + denominator]
         metrics[prefix + output] = metrics[prefix + numerator] / count if count else 0.
     metrics[prefix + "mass_delta"] = metrics[prefix + "after_mass"] - metrics[prefix + "before_mass"]
+    if prefix + 'after_repair_mass' in metrics:
+        metrics[prefix + 'repair_mass_delta'] = metrics[prefix + 'after_repair_mass'] - metrics[prefix + 'before_repair_mass']

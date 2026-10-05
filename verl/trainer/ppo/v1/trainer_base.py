@@ -413,6 +413,8 @@ class PPOTrainer(ABC):
             agent_loop_manager: The agent loop manager to generate sequences.
         """
         self.agent_loop_manager = agent_loop_manager
+        from verl.trainer.manga.frozen_audit import install_frozen_audit
+        install_frozen_audit(self)
 
         # initialize SkipManager for V1 rollout skip support
         SkipManager.init(self.config)
