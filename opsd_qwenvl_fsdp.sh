@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
-# v4.9: local privileged teacher mixture; retain legal student commands
 set -xeuo pipefail
 
 export NCCL_IB_DISABLE=1
 export CUDA_HOME="$CONDA_PREFIX"
 
-STUDENT_MODEL=${STUDENT_MODEL:-/hdd/u202212063031/magi/Qwen3-VL/models/Qwen3-VL-4B-DSL-SFT-v3.1-e1}
+TEACHER_MODEL=${TEACHER_MODEL:-../models/Qwen3-VL-4B-DSL-SFT-v3.1-e1}
+STUDENT_MODEL=${STUDENT_MODEL:-$TEACHER_MODEL}
 TRAIN_FILE=${TRAIN_FILE:-data/train.parquet}
 VAL_FILE=${VAL_FILE:-data/val.parquet}
 PROMPT_KEY=${PROMPT_KEY:-prompt}
 
 NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-1}
-TEACHER_MODEL=${TEACHER_MODEL:-$STUDENT_MODEL}
 TEACHER_NGPUS_PER_NODE=${TEACHER_NGPUS_PER_NODE:-1}
 TEACHER_NNODES=${TEACHER_NNODES:-1}
 TEACHER_TP=${TEACHER_TP:-1}
@@ -21,9 +20,18 @@ MANGA_TEACHER_MAX_INFLIGHT=${MANGA_TEACHER_MAX_INFLIGHT:-32}
 TEACHER_MAX_CONCURRENT_REQUESTS=${TEACHER_MAX_CONCURRENT_REQUESTS:-64}
 TEACHER_MM_PROCESSOR_CACHE_GB=${TEACHER_MM_PROCESSOR_CACHE_GB:-4}
 TEACHER_MAX_NUM_BATCHED_TOKENS=${TEACHER_MAX_NUM_BATCHED_TOKENS:-24576}
-TEACHER_TOPK_MAX=${TEACHER_TOPK_MAX:-128}
-DISTILLATION_TOPK=${DISTILLATION_TOPK:-32}
+DISTILLATION_TOPK=${DISTILLATION_TOPK:-64}
+TEACHER_TOPK_MAX=${TEACHER_TOPK_MAX:-$DISTILLATION_TOPK}
 ROLLOUT_TP=${ROLLOUT_TP:-1}
+OPSD_TOKEN_CLIP=${OPSD_TOKEN_CLIP:-null}
+MANGA_FAILURE_ANCHOR_WEIGHT=${MANGA_FAILURE_ANCHOR_WEIGHT:-0.2}
+MANGA_PROGRESS_WEIGHT=${MANGA_PROGRESS_WEIGHT:-0.0}
+MANGA_PROGRESS_ALPHA=${MANGA_PROGRESS_ALPHA:-0.5}
+# Collect deployment-policy trajectories greedily while retaining native T=1
+# actor and teacher distributions for OPSD.
+MANGA_STUDENT_GENERATION_TEMPERATURE=${MANGA_STUDENT_GENERATION_TEMPERATURE:-0.0}
+# One microbatch's logit-gradient proxy; no extra model forward/backward.
+MANGA_PROGRESS_PROBE_INTERVAL=${MANGA_PROGRESS_PROBE_INTERVAL:-8}
 
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-4096}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-8192}
@@ -32,16 +40,11 @@ DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-4}
 FILTER_OVERLONG_PROMPTS=${FILTER_OVERLONG_PROMPTS:-True}
 FILTER_OVERLONG_PROMPTS_WORKERS=${FILTER_OVERLONG_PROMPTS_WORKERS:-4}
 FILTER_OVERLONG_PROMPTS_CACHE_DIR=${FILTER_OVERLONG_PROMPTS_CACHE_DIR:-cache/opsd}
-PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-16}
 ENTITY_IOU_THRESHOLD=${ENTITY_IOU_THRESHOLD:-0.5}
 MANGA_MAX_COMMANDS=${MANGA_MAX_COMMANDS:-256}
-OLD_LOG_PROB_ENTROPY=${OLD_LOG_PROB_ENTROPY:-False}
 ACTOR_LR=${ACTOR_LR:-1e-6}
-MANGA_ACTION_ILLEGAL_WEIGHT=${MANGA_ACTION_ILLEGAL_WEIGHT:-1.0}
-MANGA_CORRECTNESS_LOSS=${MANGA_CORRECTNESS_LOSS:-True}
-MANGA_PREFERENCE_WEIGHT=${MANGA_PREFERENCE_WEIGHT:-0.2}
 PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}
-PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}
+PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-32768}
 
 LORA_RANK=${LORA_RANK:-64}
 LORA_ALPHA=${LORA_ALPHA:-128}
@@ -54,7 +57,7 @@ TOTAL_EPOCHS=${TOTAL_EPOCHS:-1}
 SAVE_FREQ=${SAVE_FREQ:-16}
 TEST_FREQ=${TEST_FREQ:--1}
 PROJECT_NAME=${PROJECT_NAME:-mangatrace}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-mangatrace_a_opsd_v4.9.9}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-mangatrace_a_opsd_v5.3}
 SAVE_STUDENT_ROLLOUTS=${SAVE_STUDENT_ROLLOUTS:-False}
 
 rollout_max_model_len=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH + 1))
@@ -90,13 +93,14 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.model.lora_rank=$LORA_RANK \
     actor_rollout_ref.model.lora_alpha=$LORA_ALPHA \
+    actor_rollout_ref.model.target_modules='[q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj]' \
     actor_rollout_ref.model.lora.merge=True \
-    actor_rollout_ref.actor.calculate_old_log_prob_entropy=$OLD_LOG_PROB_ENTROPY \
+    actor_rollout_ref.actor.calculate_old_log_prob_entropy=False \
     actor_rollout_ref.actor.calculate_entropy=False \
     actor_rollout_ref.actor.optim.lr=$ACTOR_LR \
-    actor_rollout_ref.actor.grad_clip=1.0 \
+    actor_rollout_ref.actor.optim.clip_grad=20.0 \
     actor_rollout_ref.actor.loss_agg_mode=token-mean \
-    actor_rollout_ref.actor.ppo_mini_batch_size=$PPO_MINI_BATCH_SIZE \
+    actor_rollout_ref.actor.ppo_mini_batch_size=$TRAIN_BATCH_SIZE \
     actor_rollout_ref.actor.ppo_epochs=1 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$PPO_MICRO_BATCH_SIZE_PER_GPU \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
@@ -117,17 +121,27 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=$ROLLOUT_GPU_MEM_UTIL \
     actor_rollout_ref.rollout.max_num_batched_tokens=$ROLLOUT_MAX_NUM_BATCHED_TOKENS \
     actor_rollout_ref.rollout.repetition_penalty=$REPETITION_PENALTY \
+    actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.rollout.max_model_len=$rollout_max_model_len \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=$PPO_MAX_TOKEN_LEN_PER_GPU \
     actor_rollout_ref.rollout.calculate_log_probs=False \
-    actor_rollout_ref.rollout.agent.default_agent_loop=manga_corrective_opsd_agent \
+    actor_rollout_ref.rollout.agent.default_agent_loop=manga_soft_opsd_agent \
     distillation.enabled=True \
     distillation.manga_opsd_enabled=True \
-    distillation.manga_action_illegal_weight=$MANGA_ACTION_ILLEGAL_WEIGHT \
-    distillation.manga_correctness_loss=$MANGA_CORRECTNESS_LOSS \
-    distillation.manga_preference_weight=$MANGA_PREFERENCE_WEIGHT \
+    distillation.manga_soft_distillation=True \
+    distillation.manga_retry_truncated=False \
+    distillation.manga_student_generation_temperature=$MANGA_STUDENT_GENERATION_TEMPERATURE \
+    distillation.manga_failure_anchor_weight=$MANGA_FAILURE_ANCHOR_WEIGHT \
+    distillation.manga_progress_weight=$MANGA_PROGRESS_WEIGHT \
+    distillation.manga_progress_alpha=$MANGA_PROGRESS_ALPHA \
+    distillation.manga_progress_probe_interval=$MANGA_PROGRESS_PROBE_INTERVAL \
+    distillation.manga_correctness_loss=False \
+    distillation.manga_action_illegal_weight=0.0 \
+    distillation.manga_sft_preservation_weight=0.0 \
+    distillation.manga_probability_transport=False \
+    distillation.manga_adaptive_preservation=False \
     distillation.n_gpus_per_node=$TEACHER_NGPUS_PER_NODE \
     distillation.nnodes=$TEACHER_NNODES \
     distillation.manga_teacher_max_inflight=$MANGA_TEACHER_MAX_INFLIGHT \
@@ -148,13 +162,10 @@ python3 -m verl.trainer.main_ppo \
     distillation.manga_max_commands=$MANGA_MAX_COMMANDS \
     distillation.distillation_loss.loss_mode=forward_kl_topk \
     distillation.distillation_loss.topk=$DISTILLATION_TOPK \
+    distillation.distillation_loss.jsd_token_clip=$OPSD_TOKEN_CLIP \
     distillation.distillation_loss.use_chunked_topk=True \
-    distillation.distillation_loss.chunked_topk_chunk_size=1024 \
-    distillation.distillation_loss.jsd_token_clip=null \
     distillation.distillation_loss.use_task_rewards=False \
     distillation.distillation_loss.use_policy_gradient=False \
-    distillation.distillation_loss.loss_max_clamp=null \
-    distillation.distillation_loss.log_prob_min_clamp=null \
     trainer.use_v1=True \
     trainer.balance_batch=True \
     trainer.n_gpus_per_node=$NGPUS_PER_NODE \

@@ -20,7 +20,20 @@ def vocabulary_for(tokenizer):
     return Vocabulary(tokenizer)
 
 
-def local_chat(messages, history, command, key):
+def command_finishes_graph(executor, command, remaining):
+    """A successful DSL command completes one graph unit; verify the last unit."""
+    if remaining > 1:
+        return False
+    import copy
+    trial = copy.copy(executor)
+    # Execution mutates GraphState only. Reuse frozen target/geometry/caches.
+    trial.state = copy.deepcopy(executor.state)
+    if not trial.execute(command):
+        raise ValueError('Privileged frontier candidate is not executable')
+    return trial.complete()
+
+
+def local_chat(messages, history, command, key, finishes_graph=None):
     import html
     kind = key[0]
     action = {
@@ -49,6 +62,16 @@ def local_chat(messages, history, command, key):
     followup = ('Given the steps completed so far, one executable next step is to ' + action + '. '
                 'The additional thumbnail highlights the relevant regions in the original image. '
                 + detail + 'Other executable next steps remain valid. Continue the sequence in the existing command format.')
+    if finishes_graph is True:
+        followup += (' Full-graph completion status: executing this highlighted command completes ALL remaining '
+                     'required graph nodes and relations. After completing this command, end the assistant response '
+                     'without adding further commands or explanations.')
+    elif finishes_graph is False:
+        followup += (' Full-graph completion status: executing this highlighted command DOES NOT complete the graph. '
+                     'Required graph nodes or relations remain afterward. This is a full-sequence task, not a '
+                     'single-command answer: after completing this command, output a newline and continue generating '
+                     'subsequent commands in the SAME assistant response until the entire graph is complete. '
+                     'Do not end the assistant response merely because this highlighted command is complete.')
     import copy
     chat = copy.deepcopy(messages)
     if history:
@@ -92,9 +115,14 @@ def box_prefix_domains(text):
 
 @lru_cache(maxsize=16384)
 def can_match_box(text, target, threshold):
+    return next(matching_boxes(text, target, threshold), None) is not None
+
+
+def matching_boxes(text, target, threshold):
+    """Yield feasible geometric witnesses without enumerating coordinate tuples."""
     domains = box_prefix_domains(text)
     if domains is None:
-        return False
+        return
     # Discrete interval/GT breakpoints avoid enumerating all coordinate tuples.
     # IoU is piecewise linear-fractional; extrema lie at interval/GT breakpoints.
     points = []
@@ -109,8 +137,9 @@ def can_match_box(text, target, threshold):
             if index < len(domain): candidates.add(domain[index])
             if index: candidates.add(domain[index-1])
         points.append(sorted(candidates))
-    return any(b[0] < b[2] and b[1] < b[3] and sg.iou(b, target) >= threshold
-               for b in itertools.product(*points))
+    for box in itertools.product(*points):
+        if box[0] < box[2] and box[1] < box[3] and sg.iou(box, target) >= threshold:
+            yield box
 
 
 class Support:
@@ -185,6 +214,72 @@ class Support:
     def payload_started(self, prefix):
         normalized, partial = self.reference_prefix(prefix)
         return normalized is not None and not partial and normalized.startswith(self.head)
+
+    def complete_from_prefix(self, prefix):
+        """Finish a feasible raw prefix using this GT node without rewriting it."""
+        if not self.viable(prefix):
+            return None
+        normalized, partial = self.reference_prefix(prefix)
+        if normalized is not None and not partial and self.command.startswith(normalized):
+            result = prefix + self.command[len(normalized):]
+            return result if self.matches_completed(result) else None
+
+        if self.key[0] == 'detect' and prefix.startswith(self.head) and sg.BOX_END in prefix:
+            closing = '</detect>'
+            for count in range(len(closing), -1, -1):
+                if prefix.endswith(closing[:count]):
+                    result = prefix + closing[count:]
+                    if self.matches_completed(result):
+                        return result
+
+        # A coordinate prefix may differ from GT while its completed box still
+        # reaches the executor IoU threshold. Complete it with the nearest
+        # feasible coordinates, then use the GT suffix of this command.
+        # references contains only command-header objects. Caption/OCR payload
+        # can contain additional boxes, including an unfinished final box.
+        structural_prefix = prefix.split('<text>', 1)[0]
+        start = structural_prefix.rfind(sg.BOX_START)
+        if start >= 0 and sg.BOX_END not in structural_prefix[start:]:
+            reference_index = structural_prefix[:start].count(sg.BOX_END)
+            if self.key[0] != 'detect' and reference_index >= len(self.references):
+                return None
+            target = (self.target if self.key[0] == 'detect' else
+                      self.references[reference_index][1])
+            body = prefix[start + len(sg.BOX_START):].split('<', 1)[0]
+            domains = box_prefix_domains(body)
+            if domains is not None:
+                options = []
+                for domain, value in zip(domains, target):
+                    nearest = min(domain, key=lambda x: abs(x-value))
+                    options.append(sorted({domain[0], domain[-1], nearest}, key=lambda x: abs(x-value)))
+                for box in itertools.product(*options):
+                    if box[0] >= box[2] or box[1] >= box[3] or sg.iou(box, target) < (
+                            self.executor.iou_threshold if self.key[0] == 'detect' else .95):
+                        continue
+                    box_text = f'({box[0]},{box[1]}),({box[2]},{box[3]})'
+                    completed = prefix[:start] + sg.BOX_START + box_text + sg.BOX_END
+                    if not completed.startswith(prefix):
+                        continue
+                    if self.key[0] == 'detect':
+                        result = completed + '</detect>'
+                    else:
+                        normalized, partial = self.reference_prefix(completed)
+                        if normalized is None or partial or not self.command.startswith(normalized):
+                            continue
+                        result = completed + self.command[len(normalized):]
+                    if self.matches_completed(result):
+                        return result
+
+        # Text content may already differ from the annotation while remaining
+        # executable. Keep it and finish only the command's closing syntax.
+        if self.key[0] in ('read', 'ground') and self.payload_started(prefix):
+            closing = '</text></' + self.key[0] + '>'
+            for count in range(len(closing), -1, -1):
+                if prefix.endswith(closing[:count]):
+                    result = prefix + closing[count:]
+                    if self.matches_completed(result):
+                        return result
+        return None
 
     def continuation(self, prefix):
         """Validate new token suffixes without rechecking already resolved objects.
@@ -302,6 +397,20 @@ class Vocabulary:
             if (prefix + body).endswith(closing) and support.viable(prefix + body + '\n'):
                 result.update(tokens)
         return result
+
+    def action_tokens(self, actions, prefix):
+        """All token spellings completing a legal action prefix, not one BPE path."""
+        result = set()
+        for action in actions:
+            if not action.startswith(prefix):
+                continue
+            node = self.trie
+            for char in action[len(prefix):]:
+                node = node.get(char)
+                if node is None:
+                    break
+                result.update(node.get(None, ()))
+        return sorted(result)
 
     def union_mask(self, supports, prefix):
         """Visit the token trie once for the union, retaining candidate identity."""

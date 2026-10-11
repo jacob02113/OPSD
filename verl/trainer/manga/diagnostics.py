@@ -18,10 +18,10 @@ def sequence_key(ids):
     return hashlib.sha256(json.dumps(list(ids)).encode()).hexdigest()[:24]
 
 
-def write_record(kind, payload):
-    if not enabled():
+def write_record(kind, payload, *, root=None):
+    if root is None and not enabled():
         return None
-    root = Path(os.environ["MANGA_DIAG_DIR"]) / kind
+    root = Path(root if root is not None else os.environ["MANGA_DIAG_DIR"]) / kind
     root.mkdir(parents=True, exist_ok=True)
     path = root / f"{os.getpid()}-{uuid4().hex}.json"
     path.write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8")

@@ -124,7 +124,7 @@ def construct_minimal_padding_template(
     ):
         if key in template_sample:
             template_sample[key] = torch.zeros_like(response_mask, dtype=torch.float32)
-    for i in range(5):
+    for i in range(32):
         key = f"manga_action_ids_{i}"
         if key in template_sample:
             template_sample[key] = torch.full_like(response_mask, -1, dtype=torch.long)
@@ -138,6 +138,20 @@ def construct_minimal_padding_template(
         template_sample["manga_boundary_stats"] = torch.zeros_like(template_sample["manga_boundary_stats"])
     if "manga_intent_stats" in template_sample:
         template_sample["manga_intent_stats"] = torch.zeros_like(template_sample["manga_intent_stats"])
+    if "manga_soft_stats" in template_sample:
+        template_sample["manga_soft_stats"] = torch.zeros_like(template_sample["manga_soft_stats"])
+    if 'manga_failure_mask' in template_sample:
+        template_sample['manga_failure_mask'] = torch.zeros_like(response_mask, dtype=torch.bool)
+        width = template_sample['manga_failure_candidates'].shape[-1]
+        template_sample['manga_failure_candidates'] = torch.zeros((2, width), dtype=torch.bool)
+    if 'manga_failure_anchor_mask' in template_sample:
+        template_sample['manga_failure_anchor_mask'] = torch.zeros_like(response_mask, dtype=torch.bool)
+    if 'manga_progress_returns' in template_sample:
+        template_sample['manga_progress_returns'] = torch.zeros_like(response_mask, dtype=torch.float32)
+        template_sample['manga_progress_weights'] = torch.zeros_like(response_mask, dtype=torch.float32)
+        template_sample['manga_progress_bins'] = torch.full_like(response_mask, -1)
+        template_sample['manga_progress_starts'] = torch.zeros_like(response_mask, dtype=torch.bool)
+        template_sample['manga_progress_stats'] = torch.zeros_like(template_sample['manga_progress_stats'])
     if "teacher_ids" in template_sample:
         topk = template_sample["teacher_ids"].shape[-1]
         template_sample["teacher_ids"] = torch.zeros((2, topk), dtype=torch.long)
@@ -149,7 +163,24 @@ def construct_minimal_padding_template(
     else:
         template_sample.pop("routed_experts", None)
 
+    if 'manga_pair_stats' in template_sample:
+        template_sample['manga_pair_stats'] = torch.zeros_like(template_sample['manga_pair_stats'])
+    if 'manga_teacher_quality' in template_sample:
+        template_sample['manga_teacher_quality'] = torch.zeros_like(template_sample['manga_teacher_quality'])
+    for key in ('manga_pair_id', 'manga_pair_ref'):
+        if key in template_sample:
+            template_sample[key] = torch.zeros_like(response_mask,
+                dtype=torch.long if key == 'manga_pair_id' else torch.float32)
     # Padding flag is deployed to protect metrics calculation (e.g. response length, score, reward).
+    if 'manga_preserve_mask' in template_sample:
+        template_sample['manga_preserve_mask'] = torch.zeros_like(response_mask, dtype=torch.bool)
+    if 'manga_preserve_group' in template_sample:
+        template_sample['manga_preserve_group'] = torch.zeros_like(response_mask, dtype=torch.long)
+    for key in ('manga_transport_exact', 'manga_transport_weights', 'manga_transport_group'):
+        if key in template_sample:
+            template_sample[key] = torch.zeros_like(response_mask, dtype=template_sample[key].dtype)
+    if 'manga_transport_edges' in template_sample:
+        template_sample['manga_transport_edges'] = template_sample['manga_transport_edges'].new_empty((0, 4))
     template_tag.update(is_padding=True, prompt_len=1, response_len=1, seq_len=2)
     return template_sample, template_tag
 

@@ -93,6 +93,11 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
         data["teacher_logprobs"] = teacher_logprobs_nested
         data["teacher_ids"] = teacher_ids_nested
 
+    if 'manga_failure_candidates' in data:
+        candidates = data['manga_failure_candidates']
+        values = index_first_axis(candidates.flatten(0, 1), indices)
+        data['manga_failure_candidates'] = torch.nested.nested_tensor_from_jagged(values, offsets=cu_seqlens)
+
     return data
 
 

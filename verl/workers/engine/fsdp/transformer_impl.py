@@ -344,18 +344,33 @@ class FSDPEngine(BaseEngine):
             }
             module = get_peft_model(module, LoraConfig(**lora_config))
 
-            # FSDP requires all params in a flat group to share dtype: cast a
-            # fp32 adapter to the bf16 base dtype only when they actually differ.
+        trainable = [parameter for parameter in module.parameters() if parameter.requires_grad]
+        if self.engine_config.strategy == "fsdp2":
+            # FSDP2 shards parameters individually, so the frozen BF16 base and FP32
+            # adapters may retain different storage dtypes. The mixed-precision policy
+            # casts FP32 adapters for compute while AdamW updates FP32 master parameters.
+            mismatched = [parameter for parameter in trainable if parameter.dtype != torch.float32]
+            for parameter in mismatched:
+                parameter.data = parameter.data.float()
+            logger.info(
+                f"Keeping {len(trainable)} trainable LoRA parameters in FP32 "
+                f"({len(mismatched)} converted) for FSDP2 optimizer updates."
+            )
+        else:
+            # FSDP1 flat parameters require a uniform dtype within each flat group.
             base_dtype = next((p.dtype for p in module.parameters() if not p.requires_grad), None)
-            if base_dtype is not None:
-                mismatched = [p for p in module.parameters() if p.requires_grad and p.dtype != base_dtype]
-                if mismatched:
-                    logger.info(
-                        f"Casting {len(mismatched)} LoRA adapter params from "
-                        f"{mismatched[0].dtype} to {base_dtype} to match base."
-                    )
-                    for param in mismatched:
-                        param.data = param.data.to(base_dtype)
+            mismatched = (
+                [parameter for parameter in trainable if parameter.dtype != base_dtype]
+                if base_dtype is not None
+                else []
+            )
+            if base_dtype is not None and mismatched:
+                logger.info(
+                    f"Casting {len(mismatched)} LoRA adapter params from "
+                    f"{mismatched[0].dtype} to {base_dtype} to match the FSDP1 base."
+                )
+                for parameter in mismatched:
+                    parameter.data = parameter.data.to(base_dtype)
 
         return module
 
@@ -448,6 +463,17 @@ class FSDPEngine(BaseEngine):
             full_state = module.state_dict()
             apply_fsdp2(module, fsdp_kwargs, self.engine_config)
             fsdp2_load_full_state_dict(module, full_state, fsdp_mesh, offload_policy)
+            if self.model_config.lora_rank > 0:
+                non_fp32_trainable = [
+                    parameter
+                    for parameter in module.parameters()
+                    if parameter.requires_grad and parameter.dtype != torch.float32
+                ]
+                if non_fp32_trainable:
+                    raise RuntimeError(
+                        "FSDP2 changed trainable LoRA master parameters from FP32; "
+                        f"found {len(non_fp32_trainable)} non-FP32 tensors"
+                    )
         else:
             raise NotImplementedError(f"Unknown strategy {self.engine_config.strategy}")
 
@@ -669,12 +695,133 @@ class FSDPEngine(BaseEngine):
             yield
 
     def train_batch(self, data: TensorDict, loss_function: Callable):
+        requested = os.environ.get('MANGA_GRADIENT_PROBE') == '1'
+        step = int(tu.get_non_tensor_data(data, 'manga_diagnostic_global_step', default=0))
+        if requested:
+            from verl.trainer.manga.diagnostics import frozen
+            if frozen() or os.environ.get('MANGA_UPDATE_COUNTERFACTUAL') == '1':
+                raise ValueError('Repair/SFT diagnostic cannot be combined with frozen mode or the old action diagnostic')
+            if torch.distributed.get_world_size() != 1 or not isinstance(self.module, FSDPModule):
+                raise ValueError('Repair/SFT diagnostic currently requires one FSDP2 actor rank (teacher may use another GPU)')
+            if getattr(self, '_qat_enabled', False):
+                raise ValueError('Repair/SFT diagnostic requires non-QAT weights')
+            weight = float(tu.get_non_tensor_data(data, 'manga_sft_preservation_weight', default=0.))
+            if weight <= 0 or 'manga_preserve_group' not in data:
+                raise ValueError('Repair/SFT diagnostic requires the preservation objective and rollout group labels')
+            decision_mask = 'manga_opsd_mask' if 'manga_transport_edges' in data else 'manga_repair_mask'
+            if not bool(data['manga_preserve_mask'].values().any()) or not bool(data[decision_mask].values().any()):
+                raise ValueError('Diagnostic batch must include supervised decisions and preserved content tokens')
+            from verl.trainer.distillation.repair_sft_audit import run_audit
+            result = run_audit(self, data, loss_function, weight)
+            from verl.utils.metric import Metric, AggregationType
+            result['metrics']['manga_repair_sft_audit/global_step'] = Metric(value=step, aggregation=AggregationType.MEAN)
+            return result
+        return self._train_batch_impl(data, loss_function)
+
+    def _train_batch_impl(self, data: TensorDict, loss_function: Callable):
+        self._soft_failure_probe = None
+        self._soft_failure_enabled = 'manga_failure_mask' in data
+        if self._soft_failure_enabled and torch.distributed.get_world_size() != 1:
+            raise ValueError('Fixed soft failure audit currently requires one actor rank (including SP)')
+        step_calls = []
+        step_hook = None
         # Replay only the first microbatch per rank, against the SAME prefixes.
         # The baseline comes from the normal training forward, not a second pass.
+        has_pairs = 'manga_pair_id' in data and bool((data['manga_pair_id'].values() != 0).any())
+        self._gradient_probe_state = None
+        self._gradient_probe_metrics = {}
+        # MANGA_GRADIENT_PROBE now routes to the complete repair/SFT audit above.
+        self._gradient_probe_active = False
+        if self._gradient_probe_active and torch.distributed.get_world_size() != 1:
+            raise RuntimeError('MANGA_GRADIENT_PROBE currently supports one actor rank only')
         self._action_pair_probe = None
-        self._capture_action_pair = True
+        self._command_pair_probe = None
+        self._command_pair_gradient_metrics = {}
+        self._command_pair_audit_enabled = has_pairs and (
+            not getattr(self, '_command_pair_audit_done', False) or bool(
+                tu.get_non_tensor_data(data, 'optimizer_probe_enabled', default=False)))
+        self._capture_action_pair = getattr(self, '_repair_sft_audit', None) is None
+        if not self._capture_action_pair:
+            self._command_pair_audit_enabled = False
+        self._update_counterfactual_audit = None
+        if (os.environ.get('MANGA_UPDATE_COUNTERFACTUAL') == '1'
+                and not getattr(self, '_update_counterfactual_done', False)
+                and 'manga_action_ids_0' in data
+                and bool((data['manga_action_ids_0'].values() >= 0).any())
+                and 'manga_group_weights' in data
+                and bool((data['manga_group_weights'].values()[:, 0] > 0).any())):
+            from verl.trainer.distillation.update_counterfactual import ActionGradientAudit
+            if torch.distributed.get_world_size() != 1:
+                raise RuntimeError('Full-batch update diagnostic requires one actor rank')
+            if not isinstance(self.optimizer, torch.optim.AdamW):
+                raise RuntimeError('Full-batch update diagnostic requires torch AdamW')
+            self._update_counterfactual_audit = ActionGradientAudit(self.module, self.optimizer)
         try:
+            if self._soft_failure_enabled:
+                step_hook = self.optimizer.register_step_post_hook(lambda *args: step_calls.append(1))
+            if self._update_counterfactual_audit is not None:
+                # autograd.grad on FSDP2's registered sharded parameters can return
+                # None even when the model's regular backward populates .grad.
+                # Run the same minibatch once through the actual backward path,
+                # without stepping, then clear its gradients before the real update.
+                from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
+                maybe_fix_3d_position_ids(data)
+                self.optimizer_zero_grad()
+                capture_pair, pair_audit = self._capture_action_pair, self._command_pair_audit_enabled
+                self._capture_action_pair = False
+                self._command_pair_audit_enabled = False
+                try:
+                    devices = [torch.cuda.current_device()] if torch.cuda.is_available() else []
+                    with torch.random.fork_rng(devices=devices):
+                        def action_only_loss(**kwargs):
+                            if 'student_logits' in kwargs:
+                                return loss_function(**kwargs)
+                            return self._update_counterfactual_audit.action_loss(**kwargs)
+
+                        self.forward_backward_batch(data, action_only_loss, forward_only=False)
+                    scaler = getattr(self, 'scaler', None)
+                    scale = scaler.get_scale() if scaler is not None else 1.
+                    self._update_counterfactual_audit.capture_action_gradients(data, scale=scale)
+                finally:
+                    self.optimizer_zero_grad()
+                    self._capture_action_pair = capture_pair
+                    self._command_pair_audit_enabled = pair_audit
             outputs = super().train_batch(data, loss_function)
+            if self._soft_failure_enabled:
+                from verl.trainer.distillation.soft_failure_audit import compare
+                from verl.trainer.manga.diagnostics import write_record
+                from verl.utils.metric import Metric, AggregationType
+                import time
+                stats = {'count': 0, 'optimizer_step_calls': len(step_calls)}
+                if self._soft_failure_probe is not None:
+                    batch, before, cpu_rng, cuda_rng, cuda_device = self._soft_failure_probe
+                    started = time.perf_counter()
+                    tu.assign_non_tensor(batch, manga_progress_probe_candidate=False)
+                    with torch.random.fork_rng(devices=[cuda_device] if cuda_device is not None else []), torch.no_grad():
+                        torch.set_rng_state(cpu_rng)
+                        if cuda_rng is not None:
+                            torch.cuda.set_rng_state(cuda_rng, cuda_device)
+                        _, post = self.forward_step(batch, loss_function=loss_function, forward_only=True)
+                    after = post.pop('soft_failure_snapshot')
+                    stats = compare(before, after)
+                    stats['optimizer_step_calls'] = len(step_calls)
+                    stats['replay_seconds'] = time.perf_counter() - started
+                    write_record('soft_failure_update', dict(
+                        step=int(tu.get_non_tensor_data(data, 'manga_diagnostic_global_step', 0)), before=before, after=after,
+                        metrics=stats, scope='first failing microbatch; routing viability on retained support',
+                        gradient_note='normal backward, includes loss normalization and any AMP scaling'),
+                        root=os.environ.get('MANGA_DIAG_DIR', 'logs'))
+                for name, value in stats.items():
+                    outputs['metrics']['manga_failure_update/' + name] = Metric(
+                        value=value, aggregation=AggregationType.MEAN)
+            if self._update_counterfactual_audit is not None:
+                from verl.utils.metric import Metric, AggregationType
+                if not getattr(self, '_update_counterfactual_metrics', None):
+                    raise RuntimeError('Full-batch update diagnostic produced no result')
+                for name, value in self._update_counterfactual_metrics.items():
+                    outputs['metrics']['manga_update_counterfactual/' + name] = Metric(
+                        aggregation=AggregationType.MEAN, value=value)
+                self._update_counterfactual_done = True
             probe = self._action_pair_probe
             if probe is not None:
                 import time
@@ -689,6 +836,12 @@ class FSDPEngine(BaseEngine):
                         torch.cuda.set_rng_state(cuda_rng, cuda_device)
                     _, post = self.forward_step(batch, loss_function=loss_function, forward_only=True)
                 after = post["model_output"]
+                if self._gradient_probe_state is not None:
+                    from verl.trainer.distillation.gradient_probe import finish
+                    self._gradient_probe_metrics.update(finish(self._gradient_probe_state, after))
+                for name, value in self._gradient_probe_metrics.items():
+                    outputs['metrics']['manga_gradient_probe/' + name] = Metric(
+                        aggregation=AggregationType.MEAN, value=value)
                 stats = paired_action_statistics(before, after)
                 names = list(stats)
                 totals = torch.stack([stats[name] for name in names])
@@ -698,10 +851,72 @@ class FSDPEngine(BaseEngine):
                             aggregation=AggregationType.SUM, value=value)
                     outputs["metrics"]["manga_action_paired/seconds"] = Metric(
                         aggregation=AggregationType.MAX, value=time.perf_counter() - started)
+            if self._command_pair_probe is not None:
+                from verl.trainer.distillation.pair_audit import snapshot, compare
+                from verl.utils.metric import Metric, AggregationType
+                import time
+                started = time.perf_counter()
+                batch, before, cpu_rng, cuda_rng, cuda_device = self._command_pair_probe
+                with torch.random.fork_rng(devices=[cuda_device] if cuda_device is not None else []), torch.no_grad():
+                    torch.set_rng_state(cpu_rng)
+                    if cuda_rng is not None:
+                        torch.cuda.set_rng_state(cuda_rng, cuda_device)
+                    _, post = self.forward_step(batch, loss_function=loss_function, forward_only=True)
+                    stats = compare(before, snapshot(post['model_output'], batch))
+                stats.update(self._command_pair_gradient_metrics)
+                stats['seconds'] = time.perf_counter() - started
+                self._command_pair_audit_done = True
+                for name, value in stats.items():
+                    outputs['metrics']['manga_pair_paired/' + name] = Metric(
+                        aggregation=AggregationType.MEAN, value=value)
+            fixed = (getattr(self, '_fixed_failure_probe', None)
+                     if getattr(self, '_repair_sft_audit', None) is None else None)
+            if fixed is not None:
+                from verl.trainer.distillation.fixed_failure_audit import snapshot, compare
+                from verl.utils.metric import Metric, AggregationType
+                batch_cpu, baseline, previous, cpu_rng, cuda_rng, cuda_device = fixed
+                import time
+                started = time.perf_counter()
+                with torch.random.fork_rng(devices=[cuda_device] if cuda_device is not None else []), torch.no_grad():
+                    torch.set_rng_state(cpu_rng)
+                    if cuda_rng is not None:
+                        torch.cuda.set_rng_state(cuda_rng, cuda_device)
+                    batch = batch_cpu.to(get_device_id())
+                    _, post = self.forward_step(batch, loss_function=loss_function, forward_only=True)
+                    current = snapshot(post['model_output'])
+                    del batch, post
+                stats = compare(baseline, previous, current)
+                # Global rates use global counts, not an average of rank-local rates.
+                names = list(stats)
+                totals = torch.tensor([stats[k] for k in names], device=get_device_id(), dtype=torch.float64)
+                torch.distributed.all_reduce(totals, group=self.get_data_parallel_group())
+                values = dict(zip(names, totals.cpu().tolist()))
+                count = values.pop('count')
+                for name, value in values.items():
+                    outputs['metrics']['manga_fixed_failure/' + name] = Metric(
+                        aggregation=AggregationType.MEAN, value=value / max(count, 1.))
+                outputs['metrics']['manga_fixed_failure/count'] = Metric(aggregation=AggregationType.MEAN, value=count)
+                self._fixed_failure_updates = getattr(self, '_fixed_failure_updates', 0) + 1
+                outputs['metrics']['manga_fixed_failure/updates'] = Metric(
+                    aggregation=AggregationType.MAX, value=self._fixed_failure_updates)
+                outputs['metrics']['manga_fixed_failure/seconds'] = Metric(
+                    aggregation=AggregationType.MAX, value=time.perf_counter() - started)
+                self._fixed_failure_probe = (batch_cpu, baseline, current, cpu_rng, cuda_rng, cuda_device)
             return outputs
         finally:
+            if step_hook is not None:
+                step_hook.remove()
+            self._soft_failure_probe = None
+            self._soft_failure_enabled = False
             self._action_pair_probe = None
+            self._command_pair_probe = None
+            self._command_pair_gradient_metrics = {}
+            self._command_pair_audit_enabled = False
             self._capture_action_pair = False
+            self._gradient_probe_state = None
+            self._gradient_probe_active = False
+            self._update_counterfactual_audit = None
+            self._update_counterfactual_metrics = None
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> list[TensorDict]:
         # note that the global_batch_size should include data on all the dp
@@ -709,12 +924,46 @@ class FSDPEngine(BaseEngine):
         return_model_output = tu.get_non_tensor_data(data=data, key="return_model_output", default=False)
 
         # compute num_tokens in global batch for loss normalization
-        batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
+        batch_num_tokens = data['manga_opsd_mask' if 'manga_progress_returns' in data else 'loss_mask'].sum().to(get_device_id())
         torch.distributed.all_reduce(
             batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
         )
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
+        if 'manga_progress_returns' in data:
+            from verl.trainer.manga.progress import baseline_tables, advantages
+            tables = baseline_tables(data['manga_progress_returns'], data['manga_progress_bins'],
+                                     data['manga_progress_starts'])
+            totals = tables.sum(0).to(get_device_id())
+            torch.distributed.all_reduce(totals, group=self.get_data_parallel_group())
+            global_table = totals.to(tables.device)
+            data['manga_progress_advantages'] = advantages(data['manga_progress_returns'],
+                data['manga_progress_bins'], tables, global_table)
+            tu.assign_non_tensor(data, manga_progress_command_count=float(totals[1, -1]))
+            if not bool((torch.as_tensor(tu.get_non_tensor_data(data, 'temperature', default=1.)) == 1).all()):
+                raise ValueError('Progress policy likelihood requires temperature=1')
+        if 'manga_pair_id' in data:
+            pair_count = torch.tensor(sum(bool((row != 0).any()) for row in data['manga_pair_id'].unbind()),
+                                      device=get_device_id(), dtype=torch.float32)
+            torch.distributed.all_reduce(pair_count, group=self.get_data_parallel_group())
+            tu.assign_non_tensor(data, manga_pair_batch_count=pair_count.item())
+            if pair_count.item() and not bool((torch.as_tensor(
+                    tu.get_non_tensor_data(data, 'temperature', default=1.0)) == 1).all()):
+                raise ValueError('Command pair likelihoods require actor temperature=1')
+        if 'manga_repair_mask' in data:
+            behavior_count = data['manga_transport_weights' if 'manga_transport_weights' in data
+                                  else 'manga_repair_weights'].values().sum().to(get_device_id())
+            torch.distributed.all_reduce(behavior_count, group=self.get_data_parallel_group())
+            tu.assign_non_tensor(data, manga_behavior_batch_count=float(behavior_count))
+        if 'manga_preserve_mask' in data:
+            preserve_count = data['manga_preserve_mask'].values().sum().to(get_device_id()).float()
+            torch.distributed.all_reduce(preserve_count, group=self.get_data_parallel_group())
+            tu.assign_non_tensor(data, manga_preserve_batch_count=float(preserve_count))
+            if 'manga_preserve_group' in data:
+                action_count = (data['manga_preserve_mask'].values().bool()
+                                & (data['manga_preserve_group'].values() == 1)).sum().to(get_device_id()).float()
+                torch.distributed.all_reduce(action_count, group=self.get_data_parallel_group())
+                tu.assign_non_tensor(data, manga_preserve_action_count=float(action_count))
         if 'manga_single_mask' in data:
             counts = torch.stack([data['manga_single_mask'].values().sum(),
                                   data['manga_multi_mask'].values().sum(),
@@ -740,6 +989,13 @@ class FSDPEngine(BaseEngine):
         )
 
         output_lst = []
+        pair_audit_target = None
+        if not forward_only and getattr(self, '_command_pair_audit_enabled', False):
+            candidates = [i for i,b in enumerate(micro_batches)
+                          if bool((b['manga_pair_id'].values() != 0).any())]
+            joint = [i for i in candidates if bool(micro_batches[i]['manga_group_weights'].values().sum() > 0)]
+            if candidates:
+                pair_audit_target = (joint or candidates)[0]
 
         ctx = torch.no_grad() if forward_only else nullcontext()
 
@@ -748,20 +1004,61 @@ class FSDPEngine(BaseEngine):
         scaler = getattr(self, "scaler", None)
 
         for micro_batch_idx, micro_batch in enumerate(micro_batches):
+            if 'manga_progress_returns' in micro_batch:
+                tu.assign_non_tensor(micro_batch,
+                    manga_progress_probe_candidate=(micro_batch_idx == 0 and not forward_only),
+                    manga_progress_probe_step=int(tu.get_non_tensor_data(data, 'manga_diagnostic_global_step', 0)))
             sync_ctx = (
                 nullcontext()
                 if forward_only
                 else self._gradient_sync_context(is_last_micro_batch=micro_batch_idx == len(micro_batches) - 1)
             )
             capture_action_pair = (getattr(self, "_capture_action_pair", False)
-                                   and not forward_only and micro_batch_idx == 0
-                                   and "manga_action_ids_0" in micro_batch)
-            if capture_action_pair:
+                                   and not forward_only and (micro_batch_idx == 0 or (
+                                       getattr(self, '_gradient_probe_active', False)
+                                       and not getattr(self, '_gradient_probe_done', False)))
+                                   and "manga_action_ids_0" in micro_batch
+                                   and bool((micro_batch['manga_action_ids_0'].values() >= 0).any()))
+            capture_command_pair = (not forward_only
+                and getattr(self, '_command_pair_audit_enabled', False)
+                and micro_batch_idx == pair_audit_target
+                and self._command_pair_probe is None
+                and bool((micro_batch['manga_pair_id'].values() != 0).any()))
+            capture_fixed_failure = False
+            if (not forward_only and getattr(self, '_capture_action_pair', False)
+                    and getattr(self, '_fixed_failure_probe', None) is None
+                    and 'manga_repair_mask' in micro_batch):
+                available = micro_batch['manga_repair_mask'].values().sum().to(get_device_id())
+                torch.distributed.all_reduce(available, group=self.get_data_parallel_group())
+                capture_fixed_failure = bool(available)
+            capture_soft_failure = (not forward_only and getattr(self, '_soft_failure_enabled', False)
+                and self._soft_failure_probe is None and bool(micro_batch['manga_failure_mask'].values().any()))
+            if getattr(self, '_soft_failure_enabled', False):
+                tu.assign_non_tensor(micro_batch, manga_failure_capture=capture_soft_failure)
+            if capture_action_pair or capture_command_pair or capture_fixed_failure or capture_soft_failure:
                 cpu_rng = torch.get_rng_state()
                 cuda_device = torch.cuda.current_device() if torch.cuda.is_available() else None
                 cuda_rng = torch.cuda.get_rng_state(cuda_device) if cuda_device is not None else None
             with ctx, sync_ctx:
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
+
+                if capture_soft_failure:
+                    self._soft_failure_probe = (micro_batch.detach().to('cpu').clone(),
+                        meta_info.pop('soft_failure_snapshot'), cpu_rng, cuda_rng, cuda_device)
+
+                if capture_fixed_failure:
+                    from verl.trainer.distillation.fixed_failure_audit import snapshot
+                    baseline = snapshot(meta_info['model_output'])
+                    # Freeze both exact token prefixes and their original legal supports.
+                    self._fixed_failure_probe = (micro_batch.detach().to('cpu').clone(), baseline,
+                                                 baseline, cpu_rng, cuda_rng, cuda_device)
+                if capture_command_pair:
+                    from verl.trainer.distillation.pair_audit import snapshot, gradient_check
+                    self._command_pair_probe = (micro_batch, snapshot(meta_info['model_output'], micro_batch),
+                                                cpu_rng, cuda_rng, cuda_device)
+                    if torch.distributed.get_world_size() == 1:
+                        self._command_pair_gradient_metrics = gradient_check(
+                            self.module, meta_info['model_output'], micro_batch)
 
                 if capture_action_pair:
                     before = {name: value.values().detach().cpu().clone()
@@ -779,6 +1076,9 @@ class FSDPEngine(BaseEngine):
                         # Specialized callers such as Tinker may opt in when their response requires these outputs.
                         meta_info.pop("model_output", None)
 
+            audit = getattr(self, '_repair_sft_audit', None)
+            if forward_only and audit is not None and audit.phase == 'after':
+                meta_info.pop('model_output', None)
             output_lst.append(meta_info)
 
         # postprocess and return
@@ -801,6 +1101,17 @@ class FSDPEngine(BaseEngine):
             grad_norm (float): Norm of gradients before clipping.
         """
         assert self.optimizer_config.clip_grad is not None
+        repair_sft_audit = getattr(self, '_repair_sft_audit', None)
+        if repair_sft_audit is not None:
+            scaler = getattr(self, 'scaler', None)
+            repair_sft_audit.before_step(scaler.get_scale() if scaler is not None else 1.,
+                                        self.optimizer_config.clip_grad)
+        audit = getattr(self, '_update_counterfactual_audit', None)
+        if audit is not None:
+            scaler = getattr(self, 'scaler', None)
+            scale = scaler.get_scale() if scaler is not None else 1.
+            self._update_counterfactual_metrics = audit.finish(
+                scale=scale, clip_norm=self.optimizer_config.clip_grad)
 
         # getattr fallback: some subclasses (e.g. VeOmniEngine) bypass FSDPEngine.__init__.
         scaler = getattr(self, "scaler", None)
@@ -1555,20 +1866,48 @@ class FSDPEngineWithLMHead(FSDPEngine):
         model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
         tree = None
-        linear_opsd = ("manga_opsd_mask" in micro_batch and "manga_tree_layout" not in micro_batch
+        layouts = ([row.tolist() for row in micro_batch['manga_tree_layout'].unbind()]
+                   if 'manga_tree_layout' in micro_batch else [])
+        has_leaves = any(len(layout) > 1 for layout in layouts)
+        linear_opsd = ("manga_opsd_mask" in micro_batch and not has_leaves
                        and tu.get_non_tensor_data(micro_batch, "distillation_only", False))
         if linear_opsd:
+            sparse_opsd_model_types = {"qwen3_vl", "qwen3_5"}
             if (self.use_ulysses_sp or not self.use_remove_padding or self.model_config.use_fused_kernels
-                    or self.module.config.model_type != "qwen3_vl"
+                    or self.module.config.model_type not in sparse_opsd_model_types
                     or tu.get_non_tensor_data(micro_batch, "calculate_entropy", False)
                     or tu.get_non_tensor_data(micro_batch, "calculate_sum_pi_squared", False)):
-                raise ValueError("Sparse OPSD projection requires Qwen3-VL, remove-padding, SP=1 and unfused logits")
+                raise ValueError(
+                    "Sparse OPSD projection requires dense Qwen3-VL/Qwen3.5, "
+                    "remove-padding, SP=1 and unfused logits"
+                )
             from verl.trainer.distillation.losses import _response_mask_to_causal_input_mask
             causal_mask = _response_mask_to_causal_input_mask(
                 micro_batch["manga_opsd_mask"], micro_batch["input_ids"]).values()
+            if 'manga_progress_bins' in micro_batch:
+                groups = micro_batch['manga_progress_bins']
+                policy_mask = torch.nested.nested_tensor_from_jagged(groups.values() >= 0, groups.offsets())
+                causal_mask = causal_mask | _response_mask_to_causal_input_mask(policy_mask, micro_batch['input_ids']).values()
             predictors = causal_mask.nonzero(as_tuple=True)[0]
             model_inputs["opsd_predictor_indices"] = predictors
-        if "manga_tree_layout" in micro_batch:
+            if 'manga_preserve_mask' in micro_batch:
+                preserve_mask = _response_mask_to_causal_input_mask(
+                    micro_batch['manga_preserve_mask'], micro_batch['input_ids']).values()
+                if bool((preserve_mask & causal_mask).any()):
+                    raise ValueError('Repair and SFT preservation positions must be disjoint')
+                preserve_positions = preserve_mask.nonzero(as_tuple=True)[0]
+                preserve_ids = micro_batch['teacher_ids'].values()[preserve_positions].long()
+                preserve_logs = micro_batch['teacher_logprobs'].values()[preserve_positions].float()
+                preserve_temperature = output_args['temperature_rmpad'].index_select(0, preserve_positions)
+                # Teacher prompt probabilities are untempered. Keep both sides identical.
+                if not bool((preserve_temperature == 1).all()):
+                    raise ValueError('Frozen SFT preservation requires actor temperature=1')
+                def preservation(head, hidden):
+                    from verl.trainer.distillation.sft_preservation import projected_preservation
+                    return projected_preservation(head, hidden.squeeze(0).index_select(0, preserve_positions),
+                                                  preserve_ids, preserve_logs, preserve_temperature)
+                model_inputs['opsd_preservation'] = preservation
+        if has_leaves:
             if (self.use_ulysses_sp or not self.use_remove_padding or self.model_config.use_fused_kernels
                     or self.module.config.model_type != "qwen3_vl"):
                 raise ValueError("Shared OPSD trees require dense Qwen3-VL, remove-padding, SP=1 and unfused logits")
@@ -1577,7 +1916,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     or tu.get_non_tensor_data(micro_batch, "calculate_sum_pi_squared", False)):
                 raise ValueError("Shared OPSD trees support direct distillation only")
             from verl.models.transformers.monkey_patch import apply_prefix_grouper_patch
-            from verl.trainer.manga.tree_attention import PageTreeAttention
+            from verl.trainer.manga.tree_attention import PageTreeAttention, restore_branch_positions
             from verl.trainer.distillation.losses import _response_mask_to_causal_input_mask
             # Shared activations cannot reproduce independent dropout masks.
             if not getattr(self, "_opsd_tree_checked", False):
@@ -1587,11 +1926,18 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     raise ValueError("Page tree attention requires FlashAttention >= 2.1")
                 if any(isinstance(m, torch.nn.Dropout) and m.p for m in self.module.modules()):
                     raise ValueError("Exact shared-history OPSD requires zero dropout")
+                for config in (self.module.config, getattr(self.module.config, 'text_config', None)):
+                    if config is not None and getattr(config, 'attention_dropout', 0):
+                        raise ValueError("Exact shared-history OPSD requires zero attention dropout")
                 apply_prefix_grouper_patch()
                 self._opsd_tree_checked = True
-            layouts = [row.tolist() for row in micro_batch["manga_tree_layout"].unbind()]
             lengths = micro_batch["input_ids"].offsets().diff().tolist()
             tree = PageTreeAttention(layouts, lengths, model_inputs["input_ids"].device)
+            positions = model_inputs['position_ids']
+            chunks = positions.split(lengths, dim=-1)
+            model_inputs['position_ids'] = torch.cat([
+                restore_branch_positions(chunk, layout) for chunk, layout in zip(chunks, layouts, strict=True)
+            ], dim=-1)
             causal_mask = _response_mask_to_causal_input_mask(
                 micro_batch["manga_opsd_mask"], micro_batch["input_ids"]).values()
             predictors = causal_mask.nonzero(as_tuple=True)[0]
@@ -1626,6 +1972,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 logits = logits / temperature.clamp(min=1e-8).to(logits.dtype)[None, :, None]
                 scalar_outputs = loss_function(student_logits=logits, data=micro_batch,
                                                student_positions=predictors)
+                if linear_opsd and 'manga_preserve_mask' in micro_batch:
+                    for name, values in (('manga_preserve_kl', raw_output.preservation_losses),
+                                         ('manga_preserve_mass', raw_output.preservation_mass)):
+                        scalar_outputs[name] = values.new_zeros((1, micro_batch['input_ids'].values().numel())).index_copy(
+                            1, preserve_positions, values.unsqueeze(0))
                 model_output = {
                     name: torch.nested.nested_tensor_from_jagged(values.squeeze(0), micro_batch["input_ids"].offsets())
                     for name, values in scalar_outputs.items()
@@ -1644,6 +1995,19 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 loss = torch.tensor(1.0, device=device_name)
                 metrics = {}
 
+            objectives = model_output.pop('_progress_objectives', None)
+            if objectives is not None:
+                from verl.trainer.distillation.progress_loss import logit_gradient_probe
+                from verl.utils.metric import Metric, AggregationType
+                for name, value in logit_gradient_probe(objectives, logits).items():
+                    metrics['manga_progress/' + name] = Metric(value=value.detach(), aggregation=AggregationType.MEAN)
+
+            if (getattr(self, '_gradient_probe_active', False) and not forward_only
+                    and not getattr(self, '_gradient_probe_done', False)):
+                from verl.trainer.distillation.gradient_probe import probe
+                self._gradient_probe_state, self._gradient_probe_metrics = probe(self.module, model_output, micro_batch)
+                self._gradient_probe_done = self._gradient_probe_state is not None
+
             # Detach model outputs before they are appended to forward_backward_batch's
             # output_lst: they are only consumed for metrics/postprocessing after backward,
             # and keeping their grad_fn alive retains part of every micro-batch's autograd
@@ -1660,6 +2024,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 "loss": loss.detach().item(),
                 "metrics": metrics,
             }
+
+            if tu.get_non_tensor_data(micro_batch, 'manga_failure_capture', False):
+                output['soft_failure_snapshot'] = tu.get_non_tensor_data(micro_batch, 'manga_failure_snapshot', None)
 
             return loss, output
 

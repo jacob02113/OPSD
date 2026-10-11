@@ -236,27 +236,6 @@ class MangaExecutor:
             "<ground>": "ground",
         }.get(tag, "invalid")
 
-    def proposal_diagnostics(self, command: str) -> dict[str, int]:
-        """Classify a raw proposal in the pre-command state without mutation.
-
-        Gate by action first, then syntax, then the selected objects. Object
-        errors include unavailable/completed targets, unmet object prerequisites,
-        and GT-incompatible link endpoints, not only unresolved box references.
-        READ/GROUND payload quality is deliberately not checked by this oracle.
-        """
-        command = command.strip()
-        kind = self.action_kind(command)
-        action_legal = kind in self.frontier_kinds()
-        result = dict(proposal_sampled=1, action_illegal=int(not action_legal),
-                      action_legal=int(action_legal), syntax_illegal=0,
-                      object_checked=0, object_illegal=0)
-        if action_legal:
-            evaluation = self.evaluate(command, compute_reward=False)
-            result["syntax_illegal"] = int(not evaluation.syntax_valid)
-            result["object_checked"] = int(evaluation.syntax_valid)
-            result["object_illegal"] = int(evaluation.syntax_valid and not evaluation.executable)
-        return result
-
     def _eligible_detection(self, kind: str, predicted: Box) -> tuple[int, float] | None:
         if kind == "character":
             boxes = self.target.character_boxes

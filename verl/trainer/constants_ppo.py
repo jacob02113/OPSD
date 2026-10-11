@@ -122,7 +122,8 @@ def get_ppo_ray_runtime_env(config=None):
     # Megatron-LM baked into the CI image at /workspace/Megatron-LM, which is not installed
     # into site-packages) stay importable. Workers do not inherit the driver's PYTHONPATH when
     # Ray is started out-of-band (e.g. `ray start --head`), so pass it through explicitly.
-    for key in ("MANGA_DIAG_DIR", "MANGA_DIAG_MODE", "MANGA_DIAG_STEPS"):
+    for key in ("MANGA_DIAG_DIR", "MANGA_DIAG_MODE", "MANGA_DIAG_STEPS", "MANGA_COMMAND_PAIR_BETA",
+                "MANGA_UPDATE_COUNTERFACTUAL", "MANGA_GRADIENT_PROBE", "MANGA_SOFT_FAILURE_AUDIT_STEP"):
         if os.environ.get(key):
             runtime_env["env_vars"][key] = os.environ[key]
     pythonpath = os.environ.get("PYTHONPATH")

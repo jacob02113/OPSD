@@ -210,6 +210,15 @@ def compute_topk_loss(
         case _:
             raise NotImplementedError(f"Unsupported strategy: {config.strategy=}")
 
+    if tu.get_non_tensor_data(data, 'manga_failure_capture', False):
+        from verl.trainer.distillation.soft_failure_audit import capture
+        if student_positions is None or distillation_config.distillation_loss.log_prob_min_clamp is not None:
+            raise ValueError('Failure audit requires sparse logits and log_prob_min_clamp=None')
+        positions = _response_mask_to_causal_input_mask(data['manga_failure_mask'], data['input_ids']).values()
+        snapshot = capture(data, student_logits, student_positions, positions,
+                           distillation_config.distillation_loss.jsd_token_clip)
+        tu.assign_non_tensor_data(data, 'manga_failure_snapshot', snapshot)
+
     normalizers = None
     if distillation_config.manga_opsd_enabled and distillation_config.manga_correctness_loss:
         if config.strategy not in ('fsdp', 'fsdp2', 'veomni'):
@@ -226,7 +235,27 @@ def compute_topk_loss(
             data_format=data_format,
             token_mask=token_mask,
             **({"student_positions": student_positions} if student_positions is not None else {}),
+            **({'sampled_token_ids': data['input_ids'].values().roll(-1).unsqueeze(0)}
+               if getattr(distillation_config, 'manga_progress_weight', 0.) else {}),
         )
+
+    if getattr(distillation_config, 'manga_progress_weight', 0.):
+        interval = distillation_config.manga_progress_probe_interval
+        step = tu.get_non_tensor_data(data, 'manga_progress_probe_step', 0)
+        tu.assign_non_tensor(data, manga_progress_probe=bool(interval and step > 0 and (step == 1 or step % interval == 0)
+            and tu.get_non_tensor_data(data, 'manga_progress_probe_candidate', False)))
+        if student_positions is None or config.strategy not in ('fsdp', 'fsdp2'):
+            raise ValueError('Progress requires the FSDP sparse actor projection')
+        # KL already computed sampled log-probabilities using its normalizer.
+        # Only the suffix without a teacher needs an additional reduction.
+        from verl.trainer.distillation.fsdp.losses import _chunked_topk_log_probs
+        suffix = ~token_mask.values()[student_positions]
+        positions = student_positions[suffix]
+        suffix_logits = student_logits[:, suffix]
+        labels = data['input_ids'].values()[positions + 1].reshape(1, -1, 1)
+        logs = _chunked_topk_log_probs(suffix_logits, labels,
+            chunk_size=distillation_config.distillation_loss.chunked_topk_chunk_size).squeeze(-1)
+        outputs['manga_progress_log_probs'] = outputs['manga_progress_log_probs'].index_copy(1, positions, logs)
 
     if "manga_action_ids_0" in data:
         from verl.trainer.distillation.action_diagnostics import action_diagnostics
@@ -315,17 +344,50 @@ def _padded(value: torch.Tensor, padding_value: float | bool = 0.0) -> torch.Ten
     return value.to_padded_tensor(padding_value) if value.is_nested else value
 
 
-def _manga_opsd_loss(config, data, distill, topk_metrics):
+def _manga_opsd_loss(config, data, distill, topk_metrics, failure_anchor_weight=0.):
     """Unified forward KL for command, structural, and boundary tokens."""
     mask = _padded(data["manga_opsd_mask"], False).bool()
-    loss = agg_loss(loss_mat=distill, loss_mask=mask,
-                    loss_agg_mode=config.loss_agg_mode, **config.global_batch_info)
+    if 'manga_pair_id' in data:
+        mask = mask & (_padded(data['manga_pair_id']) == 0)
+    base_loss = agg_loss(loss_mat=distill, loss_mask=mask,
+                         loss_agg_mode=config.loss_agg_mode, **config.global_batch_info)
+    loss = base_loss
     metrics = dict(topk_metrics)
+    anchor_weight = float(failure_anchor_weight)
+    if anchor_weight:
+        if 'manga_failure_anchor_mask' not in data:
+            raise ValueError('Failure anchor weight requires manga_failure_anchor_mask')
+        anchors = _padded(data['manga_failure_anchor_mask'], False).bool()
+        if anchors.shape != mask.shape or bool((anchors & ~mask).any()):
+            raise ValueError('Failure anchors must be supervised Manga OPSD positions')
+        # One anchor is retained per failed command.  Sequence-level token means
+        # first average failures within a trajectory, preventing failure-heavy
+        # histories from dominating, then average trajectories over the batch.
+        anchor_loss = agg_loss(loss_mat=distill, loss_mask=anchors,
+                               loss_agg_mode='seq-mean-token-mean', **config.global_batch_info)
+        loss = (1. - anchor_weight) * base_loss + anchor_weight * anchor_loss
+        metrics['manga_failure_anchor/base_loss'] = Metric(
+            value=base_loss.detach(), aggregation=AggregationType.SUM)
+        metrics['manga_failure_anchor/loss'] = Metric(
+            value=anchor_loss.detach(), aggregation=AggregationType.SUM)
+        metrics['manga_failure_anchor/weighted_loss'] = Metric(
+            value=(anchor_weight * anchor_loss).detach(), aggregation=AggregationType.SUM)
+        metrics['manga_failure_anchor/weight'] = Metric(
+            value=anchor_weight, aggregation=AggregationType.MEAN)
+        metrics['manga_failure_anchor/tokens'] = Metric(
+            value=anchors.sum(), aggregation=AggregationType.SUM)
+        metrics['manga_failure_anchor/trajectories'] = Metric(
+            value=(anchors.sum(-1) > 0).sum(), aggregation=AggregationType.SUM)
     metrics["manga_opsd/loss"] = Metric(value=loss.detach(), aggregation=AggregationType.SUM)
     metrics["manga_opsd/opsd_loss"] = Metric(
         value=(distill.detach() * mask).sum() / mask.sum().clamp_min(1),
         aggregation=AggregationType.MEAN)
     metrics["manga_opsd/opsd_tokens"] = Metric(value=mask.sum(), aggregation=AggregationType.SUM)
+    if 'manga_soft_stats' in data:
+        from verl.trainer.manga.raw_mixture import STATS
+        stats = _padded(data['manga_soft_stats']).reshape(-1, len(STATS))
+        for i, name in enumerate(STATS):
+            metrics['manga_soft/' + name] = Metric(value=stats[:, i].sum(), aggregation=AggregationType.SUM)
     if "manga_delimiter_mask" in data:
         delimiters = _padded(data["manga_delimiter_mask"], False).bool()
         for name, selected in (("delimiter", mask & delimiters), ("non_delimiter", mask & ~delimiters)):
@@ -348,7 +410,8 @@ def _manga_opsd_loss(config, data, distill, topk_metrics):
                  "fallback_unmatched_target_fallback", "fallback_completed_target_fallback",
                  "student_forced_tokens", "teacher_image_preprocess_reused",
                  "teacher_submissions_during_preparation", "repair_no_progress", "repair_round_limit",
-                 "repair_token_budget", "repair_generated_tokens")
+                 "repair_token_budget", "repair_generated_tokens",
+                 "unreachable_intent_fallback", "fallback_unreachable_intent_fallback")
         for i, name in enumerate(names):
             metrics[f"manga_intent/{name}"] = Metric(value=stats[:, i].sum(), aggregation=AggregationType.SUM)
         totals = {name: stats[:, i].sum() for i, name in enumerate(names)}
@@ -376,16 +439,7 @@ def _manga_opsd_loss(config, data, distill, topk_metrics):
                     value=distill.detach()[selected].sum() / selected.sum().clamp_min(1),
                     aggregation=AggregationType.MEAN)
         metrics["manga_command/enter_dependency_blocked"] = Metric(
-            value=stats[:, 20].sum(), aggregation=AggregationType.SUM)
-        from verl.trainer.manga.command_metrics import (
-            PROPOSAL_KINDS, PROPOSAL_METRICS, PROPOSAL_STATS_OFFSET,
-        )
-        if stats.shape[1] >= PROPOSAL_STATS_OFFSET + len(PROPOSAL_KINDS) * len(PROPOSAL_METRICS):
-            for i, kind in enumerate(PROPOSAL_KINDS):
-                for j, name in enumerate(PROPOSAL_METRICS):
-                    index = PROPOSAL_STATS_OFFSET + i * len(PROPOSAL_METRICS) + j
-                    metrics[f"manga_command/{kind}_{name}"] = Metric(
-                        value=stats[:, index].sum(), aggregation=AggregationType.SUM)
+            value=stats[:, -1].sum(), aggregation=AggregationType.SUM)
     from verl.trainer.manga.diagnostics import record_opsd_actor
     record_opsd_actor(data, distill)
     return loss, metrics
@@ -405,7 +459,11 @@ def manga_opsd_loss(
     config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
     distill, topk_metrics = compute_forward_kl_topk(config, distillation_config, model_output, data)
     loss, metrics = _manga_opsd_loss(config, data,
-        distill.detach() if distillation_config.manga_correctness_loss else distill, topk_metrics)
+        distill.detach() if distillation_config.manga_correctness_loss else distill, topk_metrics,
+        getattr(distillation_config, 'manga_failure_anchor_weight', 0.))
+    if getattr(distillation_config, 'manga_progress_weight', 0.):
+        from verl.trainer.distillation.progress_loss import add_progress_loss
+        loss = add_progress_loss(distillation_config, model_output, data, loss, metrics)
     if distillation_config.manga_correctness_loss:
         # These values are no longer all-token KL/top-k mass. Keep log names
         # explicit so historical KL curves are not compared to composite loss.
@@ -422,37 +480,95 @@ def manga_opsd_loss(
                 metrics[new] = metrics.pop(old)
         # Equal group weights; object rows already carry reciprocal per-object
         # token counts. Global denominators keep DP/microbatch splits invariant.
-        parts = []
+        # Teaching terms are diagnostics only in the failure-only experiment.
         for index, group in enumerate(('action', 'object', 'content')):
             count = float(data[f'manga_{group}_group_count'])
-            part = model_output['manga_group_' + group].values().sum() / max(count, 1.) * data['dp_size']
-            parts.append(part)
-            metrics['manga_groups/' + group + '_loss'] = Metric(
+            part = model_output['manga_group_' + group].values().detach().sum() / max(count, 1.) * data['dp_size']
+            metrics['manga_teaching_monitor/' + group + '_loss'] = Metric(
                 value=part.detach(), aggregation=AggregationType.SUM)
-            metrics['manga_groups/' + group + '_count'] = Metric(
+            metrics['manga_teaching_monitor/' + group + '_count'] = Metric(
                 value=data['manga_group_weights'].values()[:, index].sum(), aggregation=AggregationType.SUM)
-        loss = sum(parts)
+        count = float(data['manga_behavior_batch_count'])
+        behavior = model_output['manga_repair_objective'].values().sum() / max(count, 1.) * data['dp_size']
+        loss = behavior
+        if 'manga_transport_bad' in model_output:
+            rows = model_output['manga_transport_rows'].values() > 0
+            groups = model_output['manga_transport_group'].values()
+            for name, selected in (('all', rows), ('action', rows & (groups == 1)),
+                                   ('object', rows & (groups == 2))):
+                count = selected.sum()
+                metrics[f'manga_transport/{name}/count'] = Metric(value=count, aggregation=AggregationType.SUM)
+                for field in ('bad', 'unknown'):
+                    metrics[f'manga_transport/{name}/{field}_sum'] = Metric(
+                        value=model_output['manga_transport_' + field].values()[selected].sum(),
+                        aggregation=AggregationType.SUM)
+        adaptive_preserve = getattr(distillation_config, 'manga_adaptive_preservation', False)
+        preserve_weight = (float(data['manga_sft_preservation_weight']) if adaptive_preserve
+                           else distillation_config.manga_sft_preservation_weight)
+        if preserve_weight:
+            preserve_count = float(data['manga_preserve_batch_count'])
+            preserve = (model_output['manga_preserve_kl'].values().sum()
+                        / max(preserve_count, 1.) * data['dp_size'])
+            weighted_preserve = preserve_weight * preserve
+            if adaptive_preserve:
+                from verl.trainer.distillation.adaptive_preservation import action_kl_sum
+                action_count = float(data['manga_preserve_action_count'])
+                action_kl = action_kl_sum(model_output, data) * data['dp_size'] / max(action_count, 1.)
+                action_weight = float(data['manga_preserve_action_weight'])
+                weighted_preserve = weighted_preserve + action_weight * action_kl
+                metrics['manga_preserve/action_kl'] = Metric(value=action_kl.detach(), aggregation=AggregationType.SUM)
+                metrics['manga_preserve/action_tokens'] = Metric(
+                    value=(data['manga_preserve_mask'].values().bool()
+                           & (data['manga_preserve_group'].values() == 1)).sum(), aggregation=AggregationType.SUM)
+                metrics['manga_preserve/action_weight'] = Metric(value=action_weight, aggregation=AggregationType.MEAN)
+            loss = loss + weighted_preserve
+            metrics['manga_preserve/kl'] = Metric(value=preserve.detach(), aggregation=AggregationType.SUM)
+            metrics['manga_preserve/weighted_loss'] = Metric(
+                value=weighted_preserve.detach(), aggregation=AggregationType.SUM)
+            metrics['manga_preserve/tokens'] = Metric(value=data['manga_preserve_mask'].values().sum(),
+                                                    aggregation=AggregationType.SUM)
+            metrics['manga_preserve/retained_mass'] = Metric(
+                value=model_output['manga_preserve_mass'].values().sum() / max(preserve_count, 1.) * data['dp_size'],
+                aggregation=AggregationType.SUM)
+            metrics['manga_preserve/weight'] = Metric(value=preserve_weight, aggregation=AggregationType.MEAN)
+        metrics['manga_behavior/loss'] = Metric(value=behavior.detach(), aggregation=AggregationType.SUM)
+        metrics['manga_repair/conditional_kl_sum'] = Metric(
+            value=model_output['manga_preference_kl'].values().detach().sum(), aggregation=AggregationType.SUM)
+        metrics['manga_behavior/commands'] = Metric(
+            value=data['manga_transport_weights' if 'manga_transport_weights' in data else 'manga_repair_weights'].values().sum(),
+            aggregation=AggregationType.SUM)
+        metrics['manga_behavior/failures'] = Metric(
+            value=model_output['manga_repair_rows'].values().sum(), aggregation=AggregationType.SUM)
         for name in ('correctness', 'preference'):
             key = 'manga_action_' + name
             if key in model_output:
-                metrics['manga_groups/action_' + name + '_loss'] = Metric(
+                metrics['manga_teaching_monitor/action_' + name + '_loss'] = Metric(
                     value=model_output[key].values().detach().sum()
                         / max(float(data['manga_action_group_count']), 1.) * data['dp_size'],
                     aggregation=AggregationType.SUM)
         metrics['manga_correctness/single_tokens'] = Metric(
-            value=data['manga_single_mask'].values().sum(), aggregation=AggregationType.SUM)
+            value=(data['manga_single_mask'].values() & (data['manga_pair_id'].values() == 0)).sum()
+                if 'manga_pair_id' in data else data['manga_single_mask'].values().sum(),
+            aggregation=AggregationType.SUM)
         metrics['manga_correctness/multi_tokens'] = Metric(
             value=data['manga_multi_mask'].values().sum(), aggregation=AggregationType.SUM)
         metrics['manga_correctness/content_corrected'] = Metric(
             value=data['manga_content_corrections'].values().sum(), aggregation=AggregationType.SUM)
     if 'manga_repair_stats' in data:
-        stats = data['manga_repair_stats'].values().reshape(-1, 2)
-        for index, name in enumerate(('recorded', 'dropped')):
+        if 'manga_teacher_quality' in data:
+            from verl.trainer.manga.teacher_quality import KINDS, FIELDS
+            quality = data['manga_teacher_quality'].values().reshape(-1, len(KINDS), len(FIELDS)).sum(0)
+            for i,kind in enumerate(KINDS):
+                for j,field in enumerate(FIELDS):
+                    metrics[f'manga_teacher_quality/{kind}/{field}_sum'] = Metric(
+                        value=quality[i,j], aggregation=AggregationType.SUM)
+        stats = data['manga_repair_stats'].values().reshape(-1, 5)
+        for index, name in enumerate(('recorded', 'dropped', 'drop_outside_command', 'drop_prefix_changed', 'drop_target_changed')):
             metrics['manga_repair/' + name] = Metric(value=stats[:, index].sum(), aggregation=AggregationType.SUM)
     if 'manga_repair_rows' in model_output:
         for name in ('rows', 'nll', 'mass'):
             metrics['manga_repair/' + name + '_sum'] = Metric(
-                value=model_output['manga_repair_' + name].values().detach().sum(),
+                value=model_output['manga_repair_' + ('raw_nll' if name == 'nll' else name)].values().detach().sum(),
                 aggregation=AggregationType.SUM)
     if 'manga_candidate_rows' in model_output:
         # Ratios of globally aggregated SUMs can be read without averaging page means.
@@ -687,6 +803,8 @@ def compute_forward_kl_topk(
         response_mask_bool = metric_mask.bool().to_padded_tensor(False)
     else:
         response_mask_bool = metric_mask.bool()
+    if 'manga_pair_id' in data:
+        response_mask_bool = response_mask_bool & (_padded(data['manga_pair_id']) == 0)
     assert distillation_losses.shape == student_mass.shape == teacher_mass.shape == response_mask_bool.shape
 
     overlap_metrics = {}
@@ -748,8 +866,11 @@ def compute_forward_kl_topk(
             **overlap_metrics,
         }
 
-    # Tiny negative values are possible from floating-point cancellation.
-    distillation_losses = distillation_losses.clamp_min(0.0)
+    # Soft OPSD uses the complete coarse forward KL, including its tail event.
+    # Preserve its gradient even at tiny negative roundoff values. A loss floor
+    # can otherwise suppress the entire position's supervision.
+    if not getattr(distillation_config, 'manga_soft_distillation', False):
+        distillation_losses = distillation_losses.clamp_min(0.0)
 
     return distillation_losses, distillation_metrics
 

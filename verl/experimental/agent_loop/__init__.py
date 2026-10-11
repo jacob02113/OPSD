@@ -21,9 +21,10 @@ from .agent_loop import (
 )
 from .single_turn_agent_loop import SingleTurnAgentLoop
 from .manga_corrective_opsd_agent_loop import MangaCorrectiveOPSDLoop
+from .manga_soft_opsd_agent_loop import MangaSoftOPSDLoop
 from .tool_agent_loop import ToolAgentLoop
 
-_ = [SingleTurnAgentLoop, MangaCorrectiveOPSDLoop, ToolAgentLoop]
+_ = [SingleTurnAgentLoop, MangaCorrectiveOPSDLoop, MangaSoftOPSDLoop, ToolAgentLoop]
 
 __all__ = [
     "AgentLoopBase",

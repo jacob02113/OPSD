@@ -15,17 +15,34 @@ enabled: false
 
 # Teacher command correction on unchanged student histories.
 manga_opsd_enabled: false
+manga_soft_distillation: false
+manga_retry_truncated: false
+# Optional generation-only temperature. This changes trajectory collection but
+# leaves actor and teacher logits at actor_rollout_ref.rollout.temperature.
+manga_student_generation_temperature: null
+# Convex share assigned to per-trajectory means of first-invalid-token KL.
+manga_failure_anchor_weight: 0.0
+manga_progress_weight: 0.0
+manga_progress_alpha: 0.5
+manga_progress_probe_interval: 0
 # Mean illegal action probability, added to the original KL.
 manga_action_illegal_weight: 1.0
 # Action-set NLL + conditional preference; object KL; deterministic content CE.
 manga_correctness_loss: false
 manga_preference_weight: 0.1
+# Separately averaged frozen, unprivileged SFT KL on sampled non-repair tokens.
+manga_sft_preservation_weight: 0.0
+manga_adaptive_preservation: false
+manga_probability_transport: false
+manga_transport_topk: 32
+manga_preserve_budget: 0.001
+manga_preserve_action_budget: 0.02
 manga_target_key: target_json
 manga_entity_iou_threshold: 0.5
 manga_teacher_max_inflight: 4
 # Maximum non-empty student commands retained from a full-response rollout.
 manga_max_commands: 128
-manga_teacher_topk_initial: 32
+manga_teacher_topk_initial: 64
 manga_teacher_topk_max: 4096
 manga_teacher_min_mass: 0.99
 manga_correction_max_tokens: 512

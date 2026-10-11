@@ -302,6 +302,8 @@ def _get_input_embeds(
 class Qwen3VLCausalLMOutputForPPO(Qwen3VLCausalLMOutputWithPast):
     log_probs: Optional[torch.FloatTensor] = None
     entropy: Optional[torch.FloatTensor] = None
+    preservation_losses: Optional[torch.FloatTensor] = None
+    preservation_mass: Optional[torch.FloatTensor] = None
 
 
 def qwen3_vl_base_forward(
@@ -330,17 +332,26 @@ def forward_with_normal_backend(
     labels: Optional[torch.LongTensor] = None,
     temperature: float = 1.0,
     opsd_predictor_indices: Optional[torch.LongTensor] = None,
+    opsd_preservation=None,
     **kwargs,
 ) -> "Qwen3VLCausalLMOutputForPPO":
     outputs = self.model(input_ids, **kwargs)
     hidden_states = outputs[0]
-    if opsd_predictor_indices is not None:
-        hidden_states = hidden_states.index_select(1, opsd_predictor_indices)
-    logits = self.lm_head(hidden_states)
+    preservation_losses = preservation_mass = None
+    if opsd_preservation is not None:
+        from verl.trainer.distillation.sft_preservation import preservation_head_forward
+        logits, preservation_losses, preservation_mass = preservation_head_forward(
+            self.lm_head, hidden_states, opsd_predictor_indices, opsd_preservation)
+    else:
+        if opsd_predictor_indices is not None:
+            hidden_states = hidden_states.index_select(1, opsd_predictor_indices)
+        logits = self.lm_head(hidden_states)
 
     return Qwen3VLCausalLMOutputForPPO(
         logits=logits,
         hidden_states=outputs.hidden_states,
+        preservation_losses=preservation_losses,
+        preservation_mass=preservation_mass,
     )
 
 

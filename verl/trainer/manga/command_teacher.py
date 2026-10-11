@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import copy
 import html
+import logging
 
 from . import scene_graph as sg
-from .command_metrics import PROPOSAL_KINDS, PROPOSAL_METRICS, proposal_stats
+
+logger = logging.getLogger(__name__)
 
 
 def reference(kind, box):
@@ -304,10 +306,19 @@ def select_target(executor, student_command):
             local = [n for n in available if n[0] != 'enter']
             chosen = min(local, key=lambda n: node_panel(executor, n)) if local else next(iter(available))
             return available[chosen], chosen, 'dag_prerequisite'
-        for node in ready_dependencies(executor, graph, intended):
+        ready = ready_dependencies(executor, graph, intended)
+        for node in ready:
             if node in available:
                 return available[node], node, 'dag_prerequisite'
-        raise RuntimeError(f'Unfinished goal has no executable prerequisite: {intended}')
+        # A dependency may exist in the annotation DAG yet have no executable
+        # command (for example, a degenerate GT box cannot pass detection IoU).
+        # Keep this rollout on a verified executable command and expose the
+        # mismatch separately instead of aborting an otherwise valid batch.
+        local = [n for n in available if n[0] != 'enter']
+        chosen = min(local, key=lambda n: node_panel(executor, n)) if local else next(iter(available))
+        logger.warning('No executable prerequisite for %s: ready=%s, entered=%d, fallback=%s',
+                       intended, ready[:8], executor.state.entered, chosen)
+        return available[chosen], chosen, 'unreachable_intent_fallback'
     # There is no unfinished goal to preserve. Never report this as intent repair.
     local = [n for n in available if n[0] != 'enter']
     chosen = min(local, key=lambda n: node_panel(executor, n)) if local else next(iter(available))

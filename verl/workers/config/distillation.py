@@ -273,9 +273,24 @@ class DistillationConfig(BaseConfig):
     teacher_key: str = "data_source"
     # Student-goal-driven distillation on canonical GT execution histories.
     manga_opsd_enabled: bool = False
+    manga_soft_distillation: bool = False
+    manga_retry_truncated: bool = False
+    # Optional generation-only temperature for collecting student trajectories.
+    # The actor and teacher distributions still use rollout.temperature.
+    manga_student_generation_temperature: Optional[float] = None
+    manga_failure_anchor_weight: float = 0.0
+    manga_progress_weight: float = 0.0
+    manga_progress_alpha: float = 0.5
+    manga_progress_probe_interval: int = 0
     manga_action_illegal_weight: float = 1.0
     manga_correctness_loss: bool = False
     manga_preference_weight: float = 0.1
+    manga_sft_preservation_weight: float = 0.0
+    manga_adaptive_preservation: bool = False
+    manga_probability_transport: bool = False
+    manga_transport_topk: int = 32
+    manga_preserve_budget: float = 0.001
+    manga_preserve_action_budget: float = 0.02
     manga_target_key: str = "target_json"
     manga_entity_iou_threshold: float = 0.5
     manga_teacher_max_inflight: int = 4
@@ -287,6 +302,45 @@ class DistillationConfig(BaseConfig):
     distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
 
     def __post_init__(self):
+        if self.manga_retry_truncated and not self.manga_soft_distillation:
+            raise ValueError('Truncated-page retries require soft Manga OPSD')
+        generation_temperature = self.manga_student_generation_temperature
+        if generation_temperature is not None:
+            if not math.isfinite(generation_temperature) or generation_temperature < 0:
+                raise ValueError('Student generation temperature must be finite and nonnegative')
+            if not self.manga_soft_distillation:
+                raise ValueError('Student generation temperature override requires soft Manga OPSD')
+        if (not math.isfinite(self.manga_failure_anchor_weight)
+                or not 0 <= self.manga_failure_anchor_weight < 1):
+            raise ValueError('Failure anchor weight must lie in [0,1)')
+        if self.manga_failure_anchor_weight and not self.manga_soft_distillation:
+            raise ValueError('Failure anchor distillation requires soft Manga OPSD')
+        if not math.isfinite(self.manga_progress_weight) or self.manga_progress_weight < 0:
+            raise ValueError('Progress weight must be finite and nonnegative')
+        if not 0 < self.manga_progress_alpha < 1 or self.manga_progress_probe_interval < 0:
+            raise ValueError('Progress requires 0 < alpha < 1 and a nonnegative probe interval')
+        if self.manga_progress_weight and not self.manga_soft_distillation:
+            raise ValueError('Progress policy objective requires soft Manga OPSD')
+        if self.manga_soft_distillation:
+            if (not self.manga_opsd_enabled or self.manga_correctness_loss or self.manga_probability_transport
+                    or self.manga_adaptive_preservation or self.manga_sft_preservation_weight
+                    or self.manga_action_illegal_weight):
+                raise ValueError('Soft Manga OPSD requires raw distillation without correctness, transport or preservation losses')
+        if self.manga_probability_transport:
+            if not self.manga_correctness_loss or self.manga_adaptive_preservation:
+                raise ValueError('Probability transport requires correctness mode and fixed content preservation')
+            if self.manga_transport_topk <= 0:
+                raise ValueError('Transport candidate top-k must be positive')
+        if self.manga_adaptive_preservation:
+            if not .01 <= self.manga_sft_preservation_weight <= 1e4:
+                raise ValueError('Adaptive preservation requires an initial weight in [0.01, 10000]')
+            for budget in (self.manga_preserve_budget, self.manga_preserve_action_budget):
+                if not math.isfinite(budget) or budget <= 0:
+                    raise ValueError('Preservation budgets must be positive and finite')
+        if not math.isfinite(self.manga_sft_preservation_weight) or self.manga_sft_preservation_weight < 0:
+            raise ValueError('manga_sft_preservation_weight must be finite and nonnegative')
+        if self.manga_sft_preservation_weight and not self.manga_correctness_loss:
+            raise ValueError('SFT preservation requires repair-only correctness supervision')
         if self.manga_correctness_loss and self.manga_teacher_topk_max < 5:
             raise ValueError('Correctness loss requires at least five teacher action candidates')
         if not math.isfinite(self.manga_preference_weight) or self.manga_preference_weight < 0:
@@ -301,17 +355,21 @@ class DistillationConfig(BaseConfig):
             return
 
         if self.manga_opsd_enabled:
-            if not 1 <= self.manga_teacher_topk_initial <= self.manga_teacher_topk_max:
+            if not self.manga_soft_distillation and not 1 <= self.manga_teacher_topk_initial <= self.manga_teacher_topk_max:
                 raise ValueError('Invalid adaptive teacher top-k limits')
             if not 0 < self.manga_teacher_min_mass <= 1:
                 raise ValueError('Teacher retained mass must lie in (0,1]')
             loss = self.distillation_loss
             if loss.loss_mode != "forward_kl_topk" or not loss.topk or loss.topk <= 0:
                 raise ValueError("Manga OPSD requires forward_kl_topk and positive topk")
+            if self.manga_soft_distillation and loss.topk > self.manga_teacher_topk_max:
+                raise ValueError('Soft mixture top-k exceeds teacher logprob capacity')
             if min(self.manga_correction_max_tokens, self.manga_teacher_max_inflight) <= 0:
                 raise ValueError("Correction budgets and teacher concurrency must be positive")
             if loss.jsd_token_clip is not None or loss.loss_max_clamp is not None:
                 raise ValueError("Manga OPSD requires unclipped forward KL")
+            if self.manga_soft_distillation and loss.log_prob_min_clamp is not None:
+                raise ValueError('Soft Manga OPSD requires log_prob_min_clamp=None to preserve forward KL gradients')
             if loss.use_task_rewards or loss.use_policy_gradient:
                 raise ValueError("Manga OPSD uses direct supervised losses, not policy gradients")
 

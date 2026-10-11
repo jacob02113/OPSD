@@ -119,10 +119,25 @@ def task_token_losses(logits, targets, single, multi, objects, edge_rows, edge_i
         tail = qtail * (qtail.clamp_min(1e-30).log() - ptail.log())
         is_object = objects[selected]
         object_kl = object_kl.index_copy(0, selected, torch.where(is_object, terms + tail, 0.))
-        # Action supports are exact and fully returned by the teacher.
+        # The executor's legal support is exact; teacher probabilities may be sparse.
         conditional = logp - torch.where(is_object, 0., logz[selected])[:, None]
         pref = (q * torch.where(observed, logq - conditional, 0.)).sum(-1)
-        preference = preference.index_copy(0, selected, torch.where(is_object | repair[selected], 0., pref))
+        # Repairs teach q(.|legal) against the ORIGINAL student distribution.
+        # Missing teacher entries are one legal-tail event, never illegal mass.
+        vocab = logits.shape[1]
+        keys = (selected[:, None] * vocab + teacher_ids)[observed].sort().values
+        edge_keys = edge_rows * vocab + edge_ids
+        if keys.numel():
+            indices = torch.searchsorted(keys, edge_keys).clamp_max(keys.numel() - 1)
+            omitted = keys[indices] != edge_keys
+        else:
+            omitted = torch.ones_like(edge_ids, dtype=torch.bool)
+        logtail = segment_logsumexp(edge_logs[omitted], edge_rows[omitted], logits.shape[0])[selected]
+        legal_tail = logtail - logz[selected]
+        tail_pref = qtail * torch.where((qtail > 1e-6) & legal_tail.isfinite(),
+            qtail.clamp_min(1e-30).log() - legal_tail, 0.)
+        pref = pref + torch.where(repair[selected], tail_pref, 0.)
+        preference = preference.index_copy(0, selected, torch.where(is_object, 0., pref))
         mass = mass.index_copy(0, selected, torch.where(is_object, pmass_log.exp(), logz[selected].exp()))
         teacher_mass = teacher_mass.index_copy(0, selected, qmass)
     composite = ce + set_loss + preference_weight * preference + object_kl
@@ -131,6 +146,9 @@ def task_token_losses(logits, targets, single, multi, objects, edge_rows, edge_i
 
 def correctness_loss_outputs(data, student_logits, token_mask, student_positions=None, preference_weight=0.1):
     """Map packed response supports to causal input rows, preserving empty-rank autograd."""
+    if 'manga_transport_edges' in data:
+        from verl.trainer.distillation.probability_transport import loss_outputs
+        return loss_outputs(data, student_logits, token_mask, student_positions)
     selected = token_mask.values().bool()
     causal = selected.nonzero(as_tuple=True)[0]
     flat = student_logits.reshape(-1, student_logits.shape[-1])
@@ -189,7 +207,15 @@ def correctness_loss_outputs(data, student_logits, token_mask, student_positions
         manga_single_ce=scatter(ce), manga_set_loss=scatter(set_loss),
         manga_preference_kl=scatter(preference))
     if weights is not None:
-        output['manga_repair_nll'] = scatter(torch.where(repairs[causal], ce + set_loss, 0.))
+        repair_weights = torch.zeros_like(normalizer)
+        repair_weights_all = torch.zeros_like(selected, dtype=torch.float32)
+        repair_weights_all[response_causal] = data['manga_repair_weights'].values().float()
+        repair_weights = repair_weights_all[causal]
+        output['manga_repair_raw_nll'] = scatter(torch.where(repairs[causal], ce + set_loss, 0.))
+        output['manga_repair_nll'] = scatter(torch.where(repairs[causal],
+            (ce + set_loss) * repair_weights, 0.))
+        output['manga_repair_objective'] = scatter(torch.where(repairs[causal],
+            (ce + set_loss + preference) * repair_weights, 0.))
         output['manga_repair_mass'] = scatter(torch.where(repairs[causal], mass.detach(), 0.))
         output['manga_repair_rows'] = scatter(repairs[causal].float())
         # Reuse the existing paired first-microbatch replay, no extra forward.
@@ -200,6 +226,13 @@ def correctness_loss_outputs(data, student_logits, token_mask, student_positions
         output['manga_action_preference'] = scatter(preference_weight * preference * weights[causal, 0])
         for index, group in enumerate(('action', 'object', 'content')):
             output['manga_group_' + group] = scatter(composite * weights[causal, index])
+    if 'manga_pair_id' in data:
+        def pair_field(name):
+            field = rows.new_zeros(selected.numel(), dtype=torch.float32)
+            field[response_causal] = data[name].values().float()
+            return field[causal]
+        pair = pair_field('manga_pair_id') != 0
+        output['manga_pair_logp'] = scatter(torch.where(pair, -ce, 0.))
     if 'manga_candidate_edges' in data:
         # This measures CURRENT student mass outside the checked union; it remains
         # informative when rollout candidates become stale during minibatch updates.

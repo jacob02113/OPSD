@@ -49,6 +49,15 @@ async def _settle_session_tasks(tasks: list[asyncio.Task[Any]]) -> list[BaseExce
     return [result for result in results if isinstance(result, BaseException)]
 
 
+async def _preserve_session_cancellation(awaitable):
+    try:
+        return await awaitable
+    except asyncio.CancelledError as error:
+        # gather(return_exceptions=True) synthesizes a CancelledError without
+        # the original traceback. Preserve it as the cause before gathering.
+        raise RuntimeError('Agent session cancelled before publishing its output') from error
+
+
 @ray.remote
 class AgentLoopWorkerTQ(AgentLoopWorker):
     def __init__(self, *args, **kwargs):
@@ -122,9 +131,9 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             tasks = []
             for i in range(n):
                 task = asyncio.create_task(
-                    self._run_agent_loop(
+                    _preserve_session_cancellation(self._run_agent_loop(
                         run_sampling_params, trajectory=trajectory, trace=trace, session_id=i, **prompt
-                    )
+                    ))
                 )
                 tasks.append(task)
 
@@ -137,7 +146,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                         f"Error in _run_prompt for uid={uid}",
                         exc_info=(type(error), error, error.__traceback__),
                     )
-                status = "failure"
+                status = ("fatal_failure" if prompt.get("agent_name") in ("manga_corrective_opsd_agent", "manga_soft_opsd_agent")
+                          else "failure")
             else:
                 status = "finished"
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": status})
@@ -145,7 +155,9 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             logger.exception(f"Error in _run_prompt: {e}")
             if tasks:
                 await _settle_session_tasks(tasks)
-            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
+            status = ("fatal_failure" if prompt.get("agent_name") in ("manga_corrective_opsd_agent", "manga_soft_opsd_agent")
+                      else "failure")
+            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": status})
 
     async def _agent_loop_postprocess(
         self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
@@ -221,6 +233,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     "min_global_steps": field["extra_fields"].get("min_global_steps"),
                     # max_global_steps: end generation model weights version of this trajectory
                     "max_global_steps": field["extra_fields"].get("max_global_steps"),
+                    "manga_retry_truncated": field["extra_fields"].get("manga_retry_truncated", False),
+                    "manga_retry_valid_commands": field["extra_fields"].get("manga_retry_valid_commands", 0),
                 }
             )
 

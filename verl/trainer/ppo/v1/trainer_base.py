@@ -516,8 +516,6 @@ class PPOTrainer(ABC):
             tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
 
             dapo_filtered_reward_counts = metrics.pop(DAPO_FILTERED_REWARD_COUNTS_KEY, None)
-            from verl.trainer.manga.log_metrics import compact_manga_metrics
-            compact_manga_metrics(metrics)
             from verl.trainer.distillation.action_diagnostics import add_action_diagnostic_rates
             add_action_diagnostic_rates(metrics)
             self.logger.log(data=metrics, step=self.global_steps)
@@ -571,8 +569,6 @@ class PPOTrainer(ABC):
             combined_partition_id = batch.partition_id
 
         metrics.update(metrics_aggregator.get_aggregated_metrics())
-        from verl.trainer.manga.command_metrics import add_proposal_rates
-        add_proposal_rates(metrics)
         return KVBatchMeta(partition_id=combined_partition_id, keys=combined_keys, tags=combined_tags)
 
     def _step_once(self, metrics: dict, timing_raw: dict, sample_batch_size: int) -> KVBatchMeta:
@@ -723,7 +719,8 @@ class PPOTrainer(ABC):
         filter_groups = self.config.algorithm.get("filter_groups", None)
         dapo_enabled = bool(filter_groups is not None and filter_groups.get("enable", False))
         sync_refill_failed_groups = bool(self.config.trainer.v1.sampler.get("sync_refill_failed_groups", False))
-        requires_exact_refill = self.trainer_mode != "sync" or dapo_enabled or sync_refill_failed_groups
+        requires_exact_refill = (self.trainer_mode != "sync" or dapo_enabled or sync_refill_failed_groups
+                                or self.config.distillation.get('manga_retry_truncated', False))
         if requires_exact_refill:
             user_gen_batch_size = self.config.data.get("gen_batch_size", None)
             if user_gen_batch_size not in (None, 1):
@@ -878,6 +875,15 @@ class PPOTrainer(ABC):
                 del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
             )
 
+        controller = self._get_preservation_controller()
+        if controller is not None:
+            control_path = os.path.join(global_step_folder, 'preservation_controller.pt')
+            if os.path.exists(control_path):
+                from verl.trainer.distillation.adaptive_preservation import load_controller_checkpoint
+                controller.load_state_dict(load_controller_checkpoint(control_path))
+            else:
+                logger.warning('Checkpoint predates adaptive preservation: initialize fresh controller state')
+
         # 4. load dataloader checkpoint
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
         if os.path.exists(dataloader_local_path):
@@ -885,6 +891,11 @@ class PPOTrainer(ABC):
             self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             logger.warning(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+
+        if self.config.distillation.get('manga_retry_truncated', False):
+            retry_path = os.path.join(global_step_folder, 'manga_retry_pages.pt')
+            if os.path.exists(retry_path):
+                self._manga_retry_pages = torch.load(retry_path, map_location='cpu', weights_only=False)
 
         # 5. restore TransferQueue state (async modes). Re-issuing the restored in-flight prompts is
         # deferred to fit() to use the agent_loop_manager.
@@ -984,6 +995,14 @@ class PPOTrainer(ABC):
         local_mkdir_safe(local_global_step_folder)
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         torch.save(self.train_dataloader.state_dict(), dataloader_local_path)
+        if self.config.distillation.get('manga_retry_truncated', False):
+            torch.save(getattr(self, '_manga_retry_pages', {}),
+                       os.path.join(local_global_step_folder, 'manga_retry_pages.pt'))
+        controller = self._get_preservation_controller()
+        if controller is not None:
+            control_path = os.path.join(local_global_step_folder, 'preservation_controller.pt')
+            torch.save(controller.state_dict(), control_path + '.tmp')
+            os.replace(control_path + '.tmp', control_path)
 
         # save TransferQueue state for async modes so in-flight prompts (already fetched from the
         # dataloader but not yet trained into this checkpoint's weights) survive a restart:
@@ -1766,6 +1785,18 @@ class PPOTrainer(ABC):
 
         return batch
 
+    def _get_preservation_controller(self):
+        if not self._is_manga_opsd() or not self.distillation_config.manga_adaptive_preservation:
+            return None
+        if self.trainer_mode != 'sync' or self.config.actor_rollout_ref.actor.ppo_epochs != 1:
+            raise ValueError('Adaptive preservation requires synchronous OPSD with one optimizer epoch')
+        if not hasattr(self, '_preservation_controller'):
+            from verl.trainer.distillation.adaptive_preservation import PreservationController
+            cfg = self.distillation_config
+            self._preservation_controller = PreservationController(
+                (cfg.manga_preserve_budget, cfg.manga_preserve_action_budget), cfg.manga_sft_preservation_weight)
+        return self._preservation_controller
+
     def _update_actor(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Update the actor network."""
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
@@ -1807,9 +1838,16 @@ class PPOTrainer(ABC):
             # must be set on the V1 path explicitly; otherwise the worker has
             # no reliable notion of the trainer's global step.
             "optimizer_probe_enabled": self.global_steps <= 3 or self.global_steps % 50 == 0,
+            "manga_diagnostic_global_step": self.global_steps,
+            "manga_sft_preservation_weight": self.distillation_config.manga_sft_preservation_weight
+                if self._is_manga_opsd() else 0.,
         }
         if self._is_manga_opsd():
             extra_info["dataloader_kwargs"] = {"shuffle": False}
+        controller = self._get_preservation_controller()
+        if controller is not None:
+            extra_info['manga_sft_preservation_weight'] = controller.weights[0]
+            extra_info['manga_preserve_action_weight'] = controller.weights[1]
         batch.extra_info.update(extra_info)
 
         if self._is_manga_opsd():
@@ -1822,6 +1860,13 @@ class PPOTrainer(ABC):
         output["perf/mfu/actor"] = output.pop("actor/mfu")
         actor_metrics = reduce_metrics(output)
         metrics.update(actor_metrics)
+        if controller is not None:
+            from verl.trainer.manga.diagnostics import frozen
+            if not frozen() and math.isfinite(float(actor_metrics['actor/grad_norm'])):
+                feedback = controller.update(
+                    [actor_metrics['actor/manga_preserve/kl'], actor_metrics['actor/manga_preserve/action_kl']],
+                    [actor_metrics['actor/manga_preserve/tokens'], actor_metrics['actor/manga_preserve/action_tokens']])
+                metrics.update({'actor/manga_preserve_control/' + k: v for k, v in feedback.items()})
 
         return batch
 

@@ -4,7 +4,7 @@ import torch
 
 def action_diagnostics(data, logits, student_positions=None, train_legality=False, log_normalizers=None):
     inputs = data["input_ids"]
-    fields = [data[f"manga_action_ids_{i}"] for i in range(5)]
+    fields = [data[f"manga_action_ids_{i}"] for i in range(32) if f"manga_action_ids_{i}" in data]
     if not inputs.is_nested or not all(field.is_nested for field in fields):
         raise ValueError("Action diagnostics require packed jagged inputs")
     supports = torch.stack([field.values() for field in fields], dim=-1).long()

@@ -213,6 +213,11 @@ class ReplayBuffer:
                             self.finished_keys[partition_id].add(key)
                         case "failure":
                             self.failure_keys[partition_id].add(key)
+                        case "fatal_failure":
+                            raise RuntimeError(
+                                f"Manga rollout failed for uid={key}; refusing a partial training batch. "
+                                "See AgentLoopWorkerTQ session traceback for the original failure."
+                            )
                         case _:
                             raise ValueError(f"Unknown status: {tag['status']}")
                 else:

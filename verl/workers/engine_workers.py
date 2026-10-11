@@ -288,6 +288,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
             # update
             output_lst = []
             total_num_iterations = data.shape[0] // mini_batch_size_per_gpu * epochs
+            if 'manga_failure_mask' in data and total_num_iterations != 1:
+                raise ValueError('Fixed failure audit requires exactly one optimizer update per rollout batch')
+            if 'manga_progress_returns' in data and (epochs != 1 or data.shape[0] != mini_batch_size_per_gpu):
+                raise ValueError('Progress REINFORCE requires one optimizer step per fresh rollout batch')
 
             def optimizer_state_step() -> float:
                 """Read Adam's local step counter without copying model parameters."""
@@ -304,19 +308,14 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 # Adam initializes state lazily on its first optimizer step.
                 return 0.0
 
-            def parameter_probe() -> Optional[torch.Tensor]:
-                """Copy a small deterministic trainable-parameter slice for update diagnostics."""
-                module = getattr(self.engine, "module", None)
-                if module is None:
+            def parameter_probe(indexed_parameters):
+                """Capture bounded LoRA samples plus parameter and Adam-state dtypes."""
+                optimizer = getattr(self.engine, "optimizer", None)
+                if optimizer is None:
                     return None
-                for parameter in module.parameters():
-                    if not parameter.requires_grad:
-                        continue
-                    local_parameter = parameter.to_local() if hasattr(parameter, "to_local") else parameter
-                    if local_parameter.numel() == 0:
-                        continue
-                    return local_parameter.detach().reshape(-1)[:4096].float().clone()
-                return None
+                from verl.workers.optimizer_probe import capture_lora_optimizer_probe
+
+                return capture_lora_optimizer_probe(indexed_parameters, optimizer)
 
             for batch_idx, mini_batch_td in enumerate(dataloader):
                 maybe_fix_3d_position_ids(mini_batch_td)
@@ -344,14 +343,28 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 )
 
                 optimizer_step_before = optimizer_state_step() if optimizer_probe_enabled else None
-                parameter_probe_before = parameter_probe() if optimizer_probe_enabled else None
+                indexed_probe_parameters = None
+                if optimizer_probe_enabled:
+                    from verl.workers.optimizer_probe import index_lora_optimizer_parameters
+
+                    indexed_probe_parameters = index_lora_optimizer_parameters(
+                        self.engine.module, self.engine.optimizer
+                    )
+                parameter_probe_before = (
+                    parameter_probe(indexed_probe_parameters) if optimizer_probe_enabled else None
+                )
                 actor_output = self.train_batch(mini_batch_td)
                 optimizer_step_after = optimizer_state_step() if optimizer_probe_enabled else None
-                parameter_probe_after = parameter_probe() if optimizer_probe_enabled else None
+                parameter_probe_after = (
+                    parameter_probe(indexed_probe_parameters) if optimizer_probe_enabled else None
+                )
                 parameter_probe_delta_l2 = -1.0
+                parameter_probe_metrics = {}
                 if parameter_probe_before is not None and parameter_probe_after is not None:
-                    parameter_probe_delta_l2 = float(
-                        torch.linalg.vector_norm(parameter_probe_after - parameter_probe_before).item()
+                    from verl.workers.optimizer_probe import summarize_lora_optimizer_probe
+
+                    parameter_probe_metrics, parameter_probe_delta_l2 = summarize_lora_optimizer_probe(
+                        parameter_probe_before, parameter_probe_after
                     )
                 optimizer_metrics = tu.get(actor_output, "metrics")
                 optimizer_metrics["optimizer/planned_steps"] = Metric(
@@ -359,6 +372,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 )
                 optimizer_metrics["optimizer/probe_enabled"] = Metric(
                     aggregation="mean", value=float(optimizer_probe_enabled)
+                )
+                optimizer_metrics["optimizer/clip_grad"] = Metric(
+                    aggregation="mean", value=float(self.engine.optimizer_config.clip_grad)
                 )
                 optimizer_metrics.update(
                     {
@@ -376,6 +392,13 @@ class TrainingWorker(Worker, DistProfilerExtension):
                         ),
                     } if optimizer_probe_enabled else {}
                 )
+                if optimizer_probe_enabled:
+                    optimizer_metrics.update(
+                        {
+                            f"optimizer/mini_batch_{batch_idx}/{name}": Metric(aggregation="mean", value=value)
+                            for name, value in parameter_probe_metrics.items()
+                        }
+                    )
                 output_lst.append(actor_output)
                 # Advance the profiler schedule once per mini-batch. No-op unless a
                 # torch profiler schedule (wait/warmup/active/repeat) is active.

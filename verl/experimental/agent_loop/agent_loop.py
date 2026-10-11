@@ -146,9 +146,16 @@ class AgentLoopOutput(BaseModel):
             output["extra_fields"].pop("teacher_ids", None),
             output["extra_fields"].pop("teacher_logprobs", None),
         )
-        opsd_fields = ("manga_delimiter_mask", "manga_opsd_mask", "manga_boundary_mask", "manga_boundary_stats", "manga_command_types", "manga_command_starts", "manga_command_stats", "manga_intent_stats", "manga_tree_layout") + tuple(f"manga_action_ids_{i}" for i in range(5))
-        opsd_fields += ("manga_repair_stats", "manga_repair_mask", "manga_group_weights", "manga_single_mask", "manga_multi_mask", "manga_correct_edges", "manga_content_corrections",
+        opsd_fields = ("manga_delimiter_mask", "manga_opsd_mask", "manga_boundary_mask", "manga_boundary_stats", "manga_command_types", "manga_command_starts", "manga_command_stats", "manga_intent_stats", "manga_tree_layout") + tuple(f"manga_action_ids_{i}" for i in range(32))
+        opsd_fields += ("manga_repair_stats", "manga_repair_mask", "manga_repair_weights", "manga_group_weights", "manga_single_mask", "manga_multi_mask", "manga_correct_edges", "manga_content_corrections",
                         "manga_approx_mask", "manga_candidate_edges", "manga_candidate_teacher_mass", "manga_preference_edges")
+        opsd_fields += ("manga_pair_stats", "manga_pair_id", "manga_pair_ref", "manga_teacher_quality")
+        opsd_fields += ("manga_preserve_mask", "manga_preserve_group")
+        opsd_fields += ("manga_soft_stats",)
+        opsd_fields += ("manga_failure_mask", "manga_failure_candidates", "manga_failure_anchor_mask")
+        opsd_fields += ("manga_progress_returns", "manga_progress_bins", "manga_progress_starts", "manga_progress_stats")
+        opsd_fields += ("manga_progress_weights",)
+        opsd_fields += ("manga_transport_edges", "manga_transport_exact", "manga_transport_weights", "manga_transport_group")
         if teacher_ids is not None:
             output["teacher_ids"] = teacher_ids
         if teacher_logprobs is not None:
@@ -723,6 +730,8 @@ class AgentLoopWorker:
                 tools=ToolListWrap(self.tools),
                 teacher_server_manager=getattr(self, "teacher_server_manager", None),
             )
+            if agent_name == 'manga_soft_opsd_agent':
+                kwargs['_manga_audit_step'] = trajectory['step']
             output: AgentLoopOutput = await agent_loop.run(
                 sampling_params, validate=trajectory["validate"], **kwargs
             )
