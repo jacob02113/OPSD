@@ -1,10 +1,10 @@
-# MangaTrace OPSD v5.3：实验背景、现象与待讨论问题
+# MangaTrace OPSD v5.3–v5.5：实验背景、现象与待讨论问题
 
 ## 1. 这份材料希望解决什么
 
-我们在漫画页面多模态结构化理解任务上研究 on-policy self-distillation（OPSD）。当前实验同时记录到以下现象：部分固定集指标在训练早期高于初始 SFT；继续训练后，多项固定集指标下降；学生自主生成轨迹中的非法命令率上升，有效命令数、图完成率和监督覆盖下降。
+我们在漫画页面多模态结构化理解任务上研究 on-policy self-distillation（OPSD）。v5.3 实验记录到以下现象：部分固定集指标在训练早期高于初始 SFT；继续训练后，多项固定集指标下降；学生自主生成轨迹中的非法命令率上升，有效命令数、图完成率和监督覆盖下降。随后进行的 v5.5 实验把教师分布逐分量投影到当前状态的合法 next-token 集合，但该修改没有降低在线非法命令率，也没有阻止固定集检测指标继续退化。
 
-我们希望您结合代码、训练日志和评测结果，分析训练目标、教师分布、学生状态分布与固定集指标之间的关系，并给出可以通过短程实验验证的改进方案，使得模型能够在训练中稳定获得提升。
+我们希望您结合[代码](https://github.com/jacob02113/OPSD)、训练日志和评测结果，分析训练目标、教师分布、学生状态分布与固定集指标之间的关系，并给出可以通过短程实验验证的改进方案，使得模型能够在训练中稳定获得提升。
 
 训练成本较高，因此希望每项修改都对应一个明确问题，并预先确定短程检查点和判别指标。
 
@@ -30,7 +30,7 @@
 
 当前因果前缀路由会随学生前缀增长排除不兼容分量；在命令早期，仍可能同时保留多个分量。
 
-## 4. v5.3 的轨迹处理与训练配置
+## 4. 轨迹处理和训练配置
 
 仓库当前主实验的关键设置来自 `opsd_qwenvl_fsdp.sh`：
 
@@ -62,9 +62,19 @@ L = 0.8 * L_all_supervised_tokens + 0.2 * L_first_failure_anchors
 
 其中 anchor loss 先在每条轨迹内平均，再跨轨迹平均，因此权重 `0.2` 不代表它只贡献总梯度的 20%。
 
+v5.5 保持上述 v5.3 `w=0.2` 设置不变，唯一方法改动是逐分量教师合法性投影。对学生因果前缀 `h` 的活跃教师分量 `j`，以 `V_j(h)` 表示当前执行器状态下仍可延伸为可执行命令的 next-token 集，先计算：
+
+```text
+Z_j(h) = sum_{t in V_j(h)} q_j(t|h)
+q_j^legal(t|h) = q_j(t|h) * 1[t in V_j(h)] / Z_j(h)
+q_mix^legal(t|h) = (1 / |A(h)|) * sum_j q_j^legal(t|h)
+```
+
+合法集合只由当前学生前缀和执行器状态决定，不读取正在预测的 token 或未来 token。各分量先在自身合法域归一化，再保持等权混合；后续仍使用 top-k 并集、缺失概率补查、tail event 和 token-mean forward KL。v5.5 同时记录教师原始合法质量、低合法质量行、零支持分量和 failure-anchor 更新前后的概率变化。该实验运行到 step 55，并在 step 16、32、48 使用同一 100 页固定集评测。
+
 ## 5. 仓库版本与阅读入口
 
-本文基于 Git 提交 **`36506ee`**（`v5.3`）及当前仓库中的日志和结果。相关实现位于：
+相关实现位于：
 
 - `opsd_qwenvl_fsdp.sh`：主训练入口和实际超参数；
 - `verl/experimental/agent_loop/manga_soft_opsd_agent_loop.py`：greedy 学生轨迹、失败后缀屏蔽和命令边界恢复；
@@ -80,7 +90,7 @@ L = 0.8 * L_all_supervised_tokens + 0.2 * L_first_failure_anchors
 
 ## 6. 固定集结果
 
-当前 `results/` 中有八份汇总结果。每份结果均记录 `num_samples=100` ，并使用同一指标结构。
+本文汇总的固定集结果均记录 `num_samples=100`，并使用同一指标结构。
 
 ### v5.3 failure anchor weight = 0.2
 
@@ -99,6 +109,29 @@ L = 0.8 * L_all_supervised_tokens + 0.2 * L_first_failure_anchors
 
 在该序列中，command valid rate 在 s16–s64 之间为 0.994310–0.995523。Detection F1 在 s32 为 0.797409，在 s48 为 0.759190，在 s64 为 0.688201。Caption entity F1 从 s16 的 0.712329 依次变为 0.689012、0.653943 和 0.616660；caption span F1 从 0.862316 依次变为 0.827854、0.787633 和 0.736315。
 
+### v5.5 逐分量合法教师投影
+
+下表沿用前述 100 页固定集与 `repetition_penalty=1.0` 的初始 SFT 基线。三个 v5.5 JSONL 各包含 100 个无重复样例，并与 v5.3 s16 JSONL 的 sample ID 集合完全相同。
+
+| 指标 | 初始 SFT | v5.5 s16 | v5.5 s32 | v5.5 s48 |
+|---|---:|---:|---:|---:|
+| Command valid rate | 0.980921 | 0.993530 | 0.977440 | 0.993137 |
+| Panel recall | 0.884440 | 0.929026 | 0.929936 | 0.919017 |
+| Detection F1 | 0.750383 | 0.756480 | 0.751187 | 0.705721 |
+| OCR 1-EditDist | 0.643858 | 0.671992 | 0.678274 | 0.673021 |
+| OCR accuracy | 0.410872 | 0.400759 | 0.402023 | 0.400759 |
+| Speaker F1 | 0.530711 | 0.542958 | 0.556903 | 0.543083 |
+| Character AMI | 0.390539 | 0.355872 | 0.360981 | 0.366433 |
+| Character pairwise F1 | 0.395679 | 0.418278 | 0.429611 | 0.419341 |
+| Caption entity F1 | 0.682411 | 0.702630 | 0.709656 | 0.693694 |
+| Caption span F1 | 0.813962 | 0.852708 | 0.852708 | 0.828319 |
+
+v5.5 s16 相对初始 SFT 提高了 command validity、panel recall、detection、OCR 1-EditDist、speaker、character pairwise 和两项 caption 指标，但没有复现 v5.3 s16 的固定集增益。与相同步数的 v5.3 相比，v5.5 s16 的 Detection F1、Character detection F1、OCR 1-EditDist、Caption entity F1 和 Caption span F1 分别低 0.039509、0.057299、0.020687、0.009699 和 0.009609。
+
+v5.5 s32 的 caption entity、caption span、speaker 和 character pairwise F1 分别比 v5.3 s32 高 0.020644、0.024853、0.007350 和 0.005082，但 Detection F1 和 Character detection F1 分别低 0.046222 和 0.073112；command valid rate 只有 0.977440，对应 212 条无效命令，而 v5.3 s32 为 0.995329 和 42 条无效命令。到 s48，v5.5 的 caption entity/span F1 比 v5.3 s48 高 0.039751/0.040685，但 Detection F1 和 Character detection F1 低 0.053469/0.079529。相对改善主要表现为 v5.5 的 caption 指标退化较慢，而不是超过初始 SFT。
+
+v5.5 后期的 detection 下降主要来自 character 假阳性增加。Character precision 从 s16 的 0.658962 降至 s48 的 0.537203，recall 仅从 0.788820 变为 0.778656；同期 character FP 从 723 增至 1188，而 TP 从 1397 变为 1379。因此，s48 的主要错误不是漏掉更多角色，而是生成了更多错误角色框。
+
 ### failure anchor 与完整轨迹对照
 
 | 指标 | v5.3 w=0.2 s16 | v5.3 w=0 s16 | 完整轨迹 s16 | 完整轨迹 s32 |
@@ -116,7 +149,9 @@ L = 0.8 * L_all_supervised_tokens + 0.2 * L_first_failure_anchors
 
 `w=0` 与 `w=0.2` 的 s16 数值接近。完整轨迹版本从 s16 到 s32 时，command valid rate 从 0.994789 变为 0.972094，detection F1 从 0.769614 变为 0.763881，caption entity F1 从 0.708487 变为 0.681960，caption span F1 从 0.859498 变为 0.822317；同期 OCR、speaker、Character AMI 和 pairwise F1 的变化方向不同。
 
-## 7. 两个 v5.3 长程实验的轨迹记录
+## 7. v5.3 与 v5.5 的训练轨迹记录
+
+### 两个 v5.3 长程实验
 
 下面按每 16 个 optimizer steps 汇总两个长程实验。非法命令率按总非法命令数除以总命令数计算，有效命令/页按总有效命令数除以总页面数计算。
 
@@ -137,6 +172,39 @@ L = 0.8 * L_all_supervised_tokens + 0.2 * L_first_failure_anchors
 - 监督利用率下降到约 0.27。
 
 在 `failure_anchor_weight=0` 的记录中，同样出现了非法命令率上升、有效命令/页下降、完成率下降和监督利用率下降。
+
+### v5.5 合法教师投影实验
+
+v5.5 日志共有 55 个连续 optimizer steps。下表仍按总计数汇总非法命令率、有效命令/页、完成率、提前 EOS 和监督 token 利用率；step 49–55 只有 7 个 batch，因此单独列为不完整窗口。
+
+| Steps | 非法命令率 | 有效命令/页 | 完成率 | 提前 EOS | 监督 token 利用率 | Sparse support overlap |
+|---|---:|---:|---:|---:|---:|---:|
+| 1–16 | 0.6800 | 15.10 | 0.1562 | 0.7969 | 0.3791 | 0.2953 |
+| 17–32 | 0.6736 | 16.19 | 0.1445 | 0.8242 | 0.3912 | 0.2872 |
+| 33–48 | 0.6834 | 13.88 | 0.1289 | 0.8516 | 0.3737 | 0.2954 |
+| 49–55 | 0.7444 | 12.23 | 0.0536 | 0.9018 | 0.3381 | 0.2860 |
+
+v5.5 在前 32 步没有改善 v5.3 的在线行为。v5.5 step 1–16 和 17–32 的非法命令率为 0.6800 和 0.6736，v5.3 `w=0.2` 对应窗口为 0.6812 和 0.6736；有效命令/页、完成率、提前 EOS 和监督利用率也处于相同量级。到 step 33–48，有效命令/页降至 13.88，完成率降至 0.1289，提前 EOS 升至 0.8516。最后 7 步的非法命令率进一步升至 0.7444，完成率降至 0.0536。由于合法投影改变了教师稀疏支持，表中的 sparse support overlap 不应与 v5.3 的旧 overlap 数值直接解释为同一难度下的独立质量增益。
+
+投影审计显示实现没有因为空合法域而系统性丢失监督：
+
+| Steps | 教师平均合法质量 | 低合法质量行比例 | 零支持分量 | 零支持行 | Raw KL | 失败 token 概率变化 | 保留合法质量变化 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 1–16 | 0.9657 | 0.0309 | 3 | 0 | 0.7028 | -0.000141 | 0.000029 |
+| 17–32 | 0.9616 | 0.0350 | 4 | 0 | 0.6804 | -0.000713 | 0.000539 |
+| 33–48 | 0.9657 | 0.0312 | 1 | 0 | 0.5323 | -0.001448 | 0.001235 |
+| 49–55 | 0.9594 | 0.0369 | 0 | 0 | 0.6549 | -0.002223 | 0.001409 |
+
+教师平均合法质量稳定在 0.9594–0.9657，全部 55 步均没有零支持行。与此同时，failure anchor 对局部概率的作用越来越明显：失败 token 的平均概率变化绝对值持续增大，保留合法候选的质量变化从接近零转为正值。局部训练目标因此按设计生效，但完整轨迹的非法命令率、有效命令数、完成率和提前 EOS 没有同步改善。这一分叉说明，训练 loss 或 first-failure 局部概率改善不能单独作为序列级任务效果的证据。
+
+v5.5 还没有通过在实验前设定的短程判别条件：
+
+1. s16 Detection F1 比 v5.3 s16 低 0.039509，超过 0.02 的立即停止阈值；
+2. step 17–32 非法命令率为 0.6736，没有达到 `<=0.62` 的目标；
+3. s32 command valid rate 为 0.977440，低于 0.99；
+4. s48 相对 v5.5 s16 的 Detection F1 和 Caption span F1 分别下降 0.050759 和 0.024389，均超过 step 48 所允许的 0.02。
+
+因此，v5.5 结果不支持“教师在当前学生状态上的非法 token 质量是退化的充分原因”。合法投影减缓了相对 v5.3 的后期 caption grounding 下降，却没有降低在线非法命令率，也没有阻止 character 假阳性和 detection 退化。
 
 ## 8. 完整轨迹监督对照的现有记录
 
@@ -161,8 +229,6 @@ L = 0.8 * L_all_supervised_tokens + 0.2 * L_first_failure_anchors
 | Teacher assigns lower probability to sampled suffix token | 0.4145 | 0.3795 |
 
 从 step 1–16 到 step 17–32，mixture top-1 legal rate 从 0.7006 变为 0.5672，best legal candidate probability 从 0.6628 变为 0.5367，best illegal candidate probability 从 0.2584 变为 0.3849，legal-vs-illegal top-1 margin 从 0.4044 变为 0.1519。Suffix component top-1 agreement 在两个区间均约为 0.9937。
-
-现有完整轨迹日志和固定集结果均只到 step 32，不能与两个 v5.3 实验的 step 48–96 区间作同长度比较。
 
 ## 9. 希望得到的分析形式
 
@@ -191,7 +257,8 @@ L = 0.8 * L_all_supervised_tokens + 0.2 * L_first_failure_anchors
 
 - `logs/mangatrace_a_opsd_v5.3-failure_anchor_weight0.2.metrics.jsonl`：step 1–123；
 - `logs/mangatrace_a_opsd_v5.3-failure_anchor_weight0.0.metrics.jsonl`：step 1–96；
-- `logs/mangatrace_a_opsd_v5.4-full_rollout.metrics.jsonl`：完整轨迹监督，step 1–32。
+- `logs/mangatrace_a_opsd_v5.4-full_rollout.metrics.jsonl`：完整轨迹监督，step 1–32；
+- `logs/mangatrace_a_opsd_v5.5.metrics.jsonl`：合法教师投影实验，step 1–55。
 
 ### 固定集结果
 
@@ -202,7 +269,10 @@ L = 0.8 * L_all_supervised_tokens + 0.2 * L_first_failure_anchors
 - `results/qwen3vl_4b_dsl_opsd_v5.3_w0.2_s64.json`；
 - `results/qwen3vl_4b_dsl_opsd_v5.3_w0.0_s16.json`；
 - `results/qwen3vl_4b_dsl_opsd_v5.4_s16.json`；
-- `results/qwen3vl_4b_dsl_opsd_v5.4_s32.json`。
+- `results/qwen3vl_4b_dsl_opsd_v5.4_s32.json`；
+- `results/qwen3vl_4b_dsl_opsd_v5.5_s16.json` 与对应 JSONL；
+- `results/qwen3vl_4b_dsl_opsd_v5.5_s32.json` 与对应 JSONL；
+- `results/qwen3vl_4b_dsl_opsd_v5.5_s48.json` 与对应 JSONL。
 
 ### 数据与评测
 

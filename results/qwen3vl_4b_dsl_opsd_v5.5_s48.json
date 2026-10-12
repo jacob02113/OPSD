@@ -1,0 +1,81 @@
+{
+  "num_samples": 100,
+  "iou_threshold": 0.5,
+  "invalid_commands": 65,
+  "valid_commands": 9406,
+  "command_valid_rate": 0.9931369443564565,
+  "panel_add_recall": 0.9190172884440401,
+  "detection": {
+    "overall": {
+      "tp": 2566,
+      "fp": 1353,
+      "fn": 787,
+      "precision": 0.654758867057923,
+      "recall": 0.7652848195645691,
+      "f1": 0.7057205720572057
+    },
+    "per_class": {
+      "char": {
+        "tp": 1379,
+        "fp": 1188,
+        "fn": 392,
+        "precision": 0.5372029606544605,
+        "recall": 0.7786561264822134,
+        "f1": 0.6357768556938681
+      },
+      "text": {
+        "tp": 1187,
+        "fp": 165,
+        "fn": 395,
+        "precision": 0.8779585798816568,
+        "recall": 0.7503160556257902,
+        "f1": 0.8091342876618952
+      }
+    }
+  },
+  "ocr": {
+    "num_text_instances": 1582,
+    "1-EditDist": 0.6730207681037477,
+    "CER": 0.3041333397193352,
+    "accuracy": 0.40075853350189633
+  },
+  "speaker_association": {
+    "tp": 687,
+    "fp": 469,
+    "fn": 687,
+    "precision": 0.5942906574394463,
+    "recall": 0.5,
+    "f1": 0.5430830039525691
+  },
+  "character_identification": {
+    "AMI": 0.36643320377077393,
+    "matched_character_coverage": 0.7786561264822134,
+    "pairwise": {
+      "tp": 2025,
+      "fp": 2651,
+      "fn": 2957,
+      "precision": 0.4330624465355004,
+      "recall": 0.4064632677639502,
+      "f1": 0.4193414785669911
+    }
+  },
+  "caption_grounding": {
+    "entity": {
+      "tp": 1001,
+      "fp": 335,
+      "fn": 549,
+      "precision": 0.749251497005988,
+      "recall": 0.6458064516129032,
+      "f1": 0.6936936936936936
+    },
+    "span": {
+      "tp": 1170,
+      "fp": 137,
+      "fn": 348,
+      "precision": 0.8951798010711554,
+      "recall": 0.7707509881422925,
+      "f1": 0.8283185840707965
+    }
+  },
+  "missing_predictions": 892
+}

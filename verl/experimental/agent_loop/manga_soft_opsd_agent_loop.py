@@ -11,6 +11,7 @@ from PIL import Image
 from .agent_loop import AgentLoopOutput, AgentLoopMetrics, register
 from .manga_corrective_opsd_agent_loop import MangaCorrectiveOPSDLoop, _resolve, _python_value
 from verl.trainer.manga import MangaExecutor, TargetGraph
+from verl.trainer.manga.command_teacher import frontier as privileged_frontier
 from verl.trainer.manga.local_policy import COMMAND_STOPS, COMMAND_MAX_TOKENS, command_boundary
 from verl.trainer.manga.raw_mixture import score, STATS
 
@@ -178,15 +179,26 @@ class MangaSoftOPSDLoop(MangaCorrectiveOPSDLoop):
                 was_complete = executor.complete()
                 before = completed_units(executor) if progress_weight else 0
                 failed = False
+                executed = False
                 if text:
                     counters['commands'] += 1
                     if was_complete or not executor.execute(text):
                         counters['illegal_commands'] += 1
                         failed = True
+                    else:
+                        executed = True
                 if progress_weight:
                     progress_records.append((len(history)-len(raw), len(history), before, completed_units(executor)))
                 if ended:
                     counters['early_eos'] += int(not executor.complete())
+                    break
+                if executed and not executor.complete() and not privileged_frontier(executor):
+                    # ``complete`` tracks pending target kinds, while the
+                    # privileged frontier additionally rejects commands that
+                    # cannot execute in the current state.  Stop at this dead
+                    # end before launching a teacher job that cannot be routed;
+                    # the command that reached it is already being supervised.
+                    counters['unrecoverable_commands'] += 1
                     break
                 if was_complete or not text:
                     break

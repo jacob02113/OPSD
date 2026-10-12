@@ -1872,15 +1872,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
         linear_opsd = ("manga_opsd_mask" in micro_batch and not has_leaves
                        and tu.get_non_tensor_data(micro_batch, "distillation_only", False))
         if linear_opsd:
-            sparse_opsd_model_types = {"qwen3_vl", "qwen3_5"}
             if (self.use_ulysses_sp or not self.use_remove_padding or self.model_config.use_fused_kernels
-                    or self.module.config.model_type not in sparse_opsd_model_types
+                    or self.module.config.model_type != "qwen3_vl"
                     or tu.get_non_tensor_data(micro_batch, "calculate_entropy", False)
                     or tu.get_non_tensor_data(micro_batch, "calculate_sum_pi_squared", False)):
-                raise ValueError(
-                    "Sparse OPSD projection requires dense Qwen3-VL/Qwen3.5, "
-                    "remove-padding, SP=1 and unfused logits"
-                )
+                raise ValueError("Sparse OPSD projection requires Qwen3-VL, remove-padding, SP=1 and unfused logits")
             from verl.trainer.distillation.losses import _response_mask_to_causal_input_mask
             causal_mask = _response_mask_to_causal_input_mask(
                 micro_batch["manga_opsd_mask"], micro_batch["input_ids"]).values()
