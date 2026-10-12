@@ -74,7 +74,7 @@ q_mix^legal(t|h) = (1 / |A(h)|) * sum_j q_j^legal(t|h)
 
 ## 5. 仓库版本与阅读入口
 
-相关实现位于：
+v5.3相关实现位于：
 
 - `opsd_qwenvl_fsdp.sh`：主训练入口和实际超参数；
 - `verl/experimental/agent_loop/manga_soft_opsd_agent_loop.py`：greedy 学生轨迹、失败后缀屏蔽和命令边界恢复；
@@ -241,17 +241,6 @@ v5.5 还没有通过在实验前设定的短程判别条件：
 5. 说明正结果和负结果分别会支持或排除什么机制。
 
 ## 10. 仓库内随附材料
-
-### 训练代码
-
-- `opsd_qwenvl_fsdp.sh`
-- `verl/experimental/agent_loop/manga_soft_opsd_agent_loop.py`
-- `verl/trainer/manga/raw_mixture.py`
-- `verl/trainer/distillation/losses.py`
-- `verl/trainer/distillation/fsdp/losses.py`
-- `verl/workers/engine/fsdp/transformer_impl.py`
-- `verl/workers/engine_workers.py`
-- `verl/workers/optimizer_probe.py`
 
 ### 训练日志
 
